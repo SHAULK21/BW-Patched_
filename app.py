@@ -1,4 +1,4 @@
-from bwpatcher.utils import patch_firmware
+from bwpatcher.utils import SignatureException, patch_firmware
 from bwpatcher.modules import ALL_MODULES
 from io import BytesIO
 import streamlit as st
@@ -226,6 +226,15 @@ if uploaded_file is not None and patches:
                     mime="application/octet-stream",
                     type="primary",
                     use_container_width=True
+                )
+            except SignatureException as e:
+                st.error(f"Patching failed: {str(e)}")
+                st.warning(
+                    "The selected patch signature was not found in this firmware. "
+                    "This usually means the firmware file, scooter model, controller type, or firmware version does not match the selected patch."
+                )
+                st.caption(
+                    f"Model: {scooter_model} | File size: {len(input_firmware)} bytes | Patches: {', '.join(patches)}"
                 )
             except Exception as e:
                 st.error(f"Patching failed: {str(e)}")

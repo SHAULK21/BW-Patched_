@@ -19,7 +19,7 @@
 #
 
 from bwpatcher.core_es32 import ES32Patcher
-from bwpatcher.utils import find_pattern
+from bwpatcher.utils import SignatureException, find_pattern
 
 
 class Mi5plusPatcher(ES32Patcher):
@@ -44,7 +44,13 @@ class Mi5plusPatcher(ES32Patcher):
 
         res = []
 
-        ofs_table = find_pattern(self.data, self.REGION_TABLE_SIG)
+        try:
+            ofs_table = find_pattern(self.data, self.REGION_TABLE_SIG)
+        except SignatureException:
+            raise SignatureException(
+                "Mi 5 Plus region table was not found. "
+                "Check that the selected model matches the firmware and that the file is an unpacked ES32 firmware image."
+            )
         tmp_byte = None
         for i in range(7):
             ofs = ofs_table + ((i + 1) * 4)
@@ -57,7 +63,13 @@ class Mi5plusPatcher(ES32Patcher):
             self.data[ofs:ofs + 4] = post
             res += [(f"region_free_{i}", hex(ofs), pre.hex(), post.hex())]
 
-        ofs = find_pattern(self.data, self.REGION_FIX_SIG) + len(self.REGION_FIX_SIG)
+        try:
+            ofs = find_pattern(self.data, self.REGION_FIX_SIG) + len(self.REGION_FIX_SIG)
+        except SignatureException:
+            raise SignatureException(
+                "Mi 5 Plus region check was not found. "
+                "This firmware version may use a different layout or may already be patched."
+            )
         pre = self.data[ofs:ofs + 2]
         post = self.assembly("cmp r0,#0xff")
         self.data[ofs:ofs + 2] = post

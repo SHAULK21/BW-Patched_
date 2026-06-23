@@ -18,19 +18,13 @@
 # - ShareAlike — If you remix, transform, or build upon the material, you must distribute your contributions under the same license as the original.
 #
 
-import glob
-
-from os.path import dirname, basename, isfile
-
-
-# Get all modules to import from directory
-# https://stackoverflow.com/a/47473360
-def _get_all_modules():
-    mod_paths = glob.glob(dirname(__file__) + '/*.py')
-    return [
-        basename(f)[:-3] for f in mod_paths
-        if isfile(f) and f.endswith('.py') and not f.endswith('__init__.py')
-    ]
+from bwpatcher.modules.mi5 import Mi5Patcher
+from bwpatcher.utils import find_pattern
 
 
-ALL_MODULES = sorted(_get_all_modules())
+class Mi5maxPatcher(Mi5Patcher):
+    SNS = [(0x85, 0xEC, 0x0, 0x0), (0xC4, 0xEE, 0x0, 0x0)]
+    SIG_CCU = [0x13, 0x68, 0x93, 0x4d, 0xab, 0x42, 0x1e, 0xd0, 0x12, 0x68, 0x92, 0x4b, 0x9a, 0x42, 0x1a, 0xd0]#, 0x62, 0x7a, 0x91, 0x4e, 0x00, 0x2a, 0x0e, 0xd0 ]
+
+    def __init__(self, data):
+        super().__init__(data)

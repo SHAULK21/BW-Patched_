@@ -1,0 +1,5 @@
+keystone-engine
+capstone
+crcmod
+setuptools
+streamlit-scroll-to-top

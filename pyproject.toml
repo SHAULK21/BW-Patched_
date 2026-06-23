@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "bwpatcher"
+version = "0.1.0"
+description = ""
+authors = ["scooterteam <scooterteam@proton.me>"]
+license = "CC BY-NC-SA 4.0"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">3.10"
+keystone-engine = "^0.9.2"
+capstone = "^4.0.2"
+crcmod = "^1.7"
+streamlit = "^1.40.1"
+setuptools = "^80.9.0"
+streamlit-scroll-to-top = "^0.0.4"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

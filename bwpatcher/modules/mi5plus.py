@@ -34,20 +34,23 @@ class Mi5plusPatcher(ES32Patcher):
     #   0x08005C74: ldr r1,[pc,#0x2ac] -> 0x20000234
     #   0x08005C76: ldrb r0,[r7,#9]
     #   0x08005C78: strh r0,[r1]
-    # The value at profile/object +0x09 is therefore copied into the
-    # runtime speed variable at 0x20000234. The downstream speed controller
-    # then applies its existing scale and limiter logic.
+    # The value at profile/object +0x09 is copied into the runtime speed
+    # variable at 0x20000234. The downstream controller applies its scale
+    # and limiter logic.
     #
-    # IMPORTANT: this proves one active-profile speed source, but it does NOT
-    # prove that three independent Eco/Drive/Sport bytes are present at this
-    # location. The profile-selection/copy mechanism has not been isolated
-    # sufficiently to expose three safe patch sites. Do not manufacture three
-    # signatures by reusing the same location.
+    # A second important candidate was isolated while tracing profile use:
+    #   0x200002B7 is read as an 8-bit index in several nearby functions and
+    #   is subsequently used as a table/array offset. This is consistent with
+    #   an active-profile/mode selector, but the producer of this byte and its
+    #   exact 0/1/2 -> Eco/Drive/Sport mapping are NOT yet proven.
+    # Do not patch this byte or manufacture three speed signatures from it.
     SPEED_PROFILE_LOAD_OFFSET = 0x05C74
     SPEED_PROFILE_LOAD_SIG = (0xAB, 0x49, 0x78, 0x7A, 0x08, 0x80)
     SPEED_PROFILE_VALUE_INSN_OFFSET = 2
     SPEED_PROFILE_VALUE_FIELD = 0x09
     SPEED_RUNTIME_ADDR = 0x20000234
+    SPEED_ACTIVE_PROFILE_INDEX_ADDR = 0x200002B7
+    SPEED_ACTIVE_PROFILE_INDEX_READ_OFFSETS = (0x05A80, 0x05B7C, 0x05BA0, 0x05BC2, 0x05BE2, 0x05C90)
     SPEED_SCALE_NUMERATOR = 0xAE
     SPEED_SCALE_DIVISOR = 10
 
@@ -70,6 +73,8 @@ class Mi5plusPatcher(ES32Patcher):
             "speed_control": (cls.SPEED_CONTROL_START, cls.SPEED_CONTROL_END),
             "speed_profile_load": cls.SPEED_PROFILE_LOAD_OFFSET,
             "speed_runtime_addr": cls.SPEED_RUNTIME_ADDR,
+            "speed_active_profile_index_addr": cls.SPEED_ACTIVE_PROFILE_INDEX_ADDR,
+            "speed_active_profile_index_reads": cls.SPEED_ACTIVE_PROFILE_INDEX_READ_OFFSETS,
             "speed_target_field": cls.SPEED_FIELD_TARGET,
             "speed_limit_field": cls.SPEED_FIELD_LIMIT,
             "control_field_26": cls.CONTROL_FIELD_26,

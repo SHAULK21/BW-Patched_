@@ -1,3 +1,22 @@
+"""Xiaomi 5 Plus (Brightway) firmware module.
+
+Verified speed path for the supplied MCU image:
+
+    file 0x5C74: AB 49 78 7A 08 80
+    file 0x5C76: LDRB r0,[r7,#9]
+    file 0x5C78: STRH r0,[r1]       ; r1 -> 0x20000234
+
+The value then enters the controller path around 0x08003698-0x08003964.
+The controller scales the runtime value by 174/10 and stores the resulting
+limit in its +0x18 field; +0x14 is subsequently clamped to +0x18.
+
+Important limitation: this image does NOT provide enough evidence to map
+three independent Eco/Drive/Sport speed storage locations. The 0x200002B7
+byte is used as a small runtime index/counter and must not be treated as a
+proven 0/1/2 mode selector. Consequently this module exposes only the verified
+active-profile speed hook and deliberately refuses guessed Sport/Eco patches.
+"""
+
 from bwpatcher.core_es32 import ES32Patcher
 from bwpatcher.utils import find_pattern
 
@@ -5,7 +24,7 @@ from bwpatcher.utils import find_pattern
 class Mi5plusPatcher(ES32Patcher):
     NAME = "Xiaomi Electric Scooter 5 Plus"
 
-    # Reverse-engineering map for the supplied mcu_xiaomi.scooter.5plus.bin
+    # Reverse-engineering map for the supplied mcu_xiaomi.scooter.5plus.bin.
     # SHA-256: bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4
     PARAM_REGISTER_ADDR = 0x08009818
     PARAM_REGISTER_DISPATCH_ADDR = 0x080099BC
@@ -30,27 +49,21 @@ class Mi5plusPatcher(ES32Patcher):
     PARAM_DISPATCH_START = 0x08009D44
     PARAM_DISPATCH_END = 0x08009E30
 
-    # Verified on the supplied image:
-    #   0x08005C74: ldr r1,[pc,#0x2ac] -> 0x20000234
-    #   0x08005C76: ldrb r0,[r7,#9]
-    #   0x08005C78: strh r0,[r1]
-    # The value at profile/object +0x09 is copied into the runtime speed
-    # variable at 0x20000234. The downstream controller applies its scale
-    # and limiter logic.
-    #
-    # A second important candidate was isolated while tracing profile use:
-    #   0x200002B7 is read as an 8-bit index in several nearby functions and
-    #   is subsequently used as a table/array offset. This is consistent with
-    #   an active-profile/mode selector, but the producer of this byte and its
-    #   exact 0/1/2 -> Eco/Drive/Sport mapping are NOT yet proven.
-    # Do not patch this byte or manufacture three speed signatures from it.
+    # Exact verified sequence at file offset 0x5C74.
     SPEED_PROFILE_LOAD_OFFSET = 0x05C74
     SPEED_PROFILE_LOAD_SIG = (0xAB, 0x49, 0x78, 0x7A, 0x08, 0x80)
     SPEED_PROFILE_VALUE_INSN_OFFSET = 2
     SPEED_PROFILE_VALUE_FIELD = 0x09
     SPEED_RUNTIME_ADDR = 0x20000234
+
+    # 0x200002B7 is a runtime byte used as an index/counter in the examined
+    # code. It is retained as RE metadata only; it is NOT a mode patch point.
     SPEED_ACTIVE_PROFILE_INDEX_ADDR = 0x200002B7
-    SPEED_ACTIVE_PROFILE_INDEX_READ_OFFSETS = (0x05A80, 0x05B7C, 0x05BA0, 0x05BC2, 0x05BE2, 0x05C90)
+    SPEED_ACTIVE_PROFILE_INDEX_READ_OFFSETS = (
+        0x05A80, 0x05B7C, 0x05BA0,
+        0x05BC2, 0x05BE2, 0x05C90,
+    )
+
     SPEED_SCALE_NUMERATOR = 0xAE
     SPEED_SCALE_DIVISOR = 10
 
@@ -105,42 +118,80 @@ class Mi5plusPatcher(ES32Patcher):
             return [("region_patch", "already_global", "forced_success", "done")]
         return res
 
+    def _find_verified_speed_hook(self):
+        """Return the unique verified speed-hook offset or raise ValueError."""
+        sig = list(self.SPEED_PROFILE_LOAD_SIG)
+        ofs = find_pattern(self.data, sig)
+        if ofs < 0:
+            raise ValueError("Mi 5 Plus: verified speed signature not found")
+
+        # Do not silently accept a duplicate match if find_pattern's behavior
+        # changes in the future. Check the entire image explicitly.
+        hits = []
+        start = 0
+        raw = bytes(sig)
+        data = bytes(self.data)
+        while True:
+            hit = data.find(raw, start)
+            if hit < 0:
+                break
+            hits.append(hit)
+            start = hit + 1
+        if len(hits) != 1:
+            raise ValueError(
+                f"Mi 5 Plus: speed signature is not unique ({len(hits)} matches)"
+            )
+        if hits[0] != self.SPEED_PROFILE_LOAD_OFFSET:
+            raise ValueError(
+                f"Mi 5 Plus: unexpected speed signature offset 0x{hits[0]:X}"
+            )
+        return hits[0]
+
     def _patch_speed_profile(self, speed):
         speed_i = int(round(float(speed)))
         if not 1 <= speed_i <= 255:
-            raise ValueError("Mi 5 Plus speed must be between 1 and 255 km/h")
+            raise ValueError("Mi 5 Plus speed must be between 1 and 255")
 
-        ofs = find_pattern(self.data, list(self.SPEED_PROFILE_LOAD_SIG))
+        ofs = self._find_verified_speed_hook()
         value_ofs = ofs + self.SPEED_PROFILE_VALUE_INSN_OFFSET
-        pre = self.data[value_ofs:value_ofs + 2]
-        post = self.assembly(f"movs r0,#{speed_i}")
-        if len(post) != 2:
-            raise ValueError("Unexpected Thumb instruction size for speed patch")
+        pre = bytes(self.data[value_ofs:value_ofs + 2])
+        expected = bytes((0x78, 0x7A))  # LDRB r0,[r7,#9]
+        if pre != expected:
+            raise ValueError(
+                f"Mi 5 Plus: unexpected instruction at 0x{value_ofs:X}: {pre.hex()}"
+            )
 
+        # Thumb: MOVS r0,#imm8 == imm8 20.
+        post = bytes((speed_i, 0x20))
         self.data[value_ofs:value_ofs + 2] = post
+
         return [
-            ("speed_limit_5plus_active_profile", hex(value_ofs), pre.hex(), post.hex()),
-            ("speed_limit_5plus_source", hex(ofs),
-             bytes(self.SPEED_PROFILE_LOAD_SIG).hex(),
-             bytes(self.SPEED_PROFILE_LOAD_SIG).hex()),
+            ("speed_limit_5plus_active_profile",
+             hex(value_ofs), pre.hex(), post.hex()),
+            ("speed_limit_5plus_source",
+             hex(ofs), expected.hex(), expected.hex()),
         ]
 
     def speed_limit_drive(self, speed):
-        # The supplied image currently exposes one verified active-profile
-        # speed source. Keep SLD usable, but do not pretend it is a distinct
-        # Drive-only storage slot until profile selection is isolated.
+        """Patch the verified active-profile speed input.
+
+        Historical API compatibility: this is NOT proven to be Drive-only.
+        """
         return self._patch_speed_profile(speed)
 
     def speed_limit_sport(self, speed):
         raise ValueError(
-            "Mi 5 Plus: Sport-specific speed source is not yet isolated; "
-            "refusing to patch the Drive/active-profile location as Sport."
+            "Mi 5 Plus: Sport-specific speed source is unverified; refusing a guessed patch."
+        )
+
+    def speed_limit_eco(self, speed):
+        raise ValueError(
+            "Mi 5 Plus: Eco-specific speed source is unverified; refusing a guessed patch."
         )
 
     def remove_speed_limit_sport(self):
         raise ValueError(
-            "Mi 5 Plus: Sport-specific speed source is not yet isolated; "
-            "refusing to apply a guessed Sport patch."
+            "Mi 5 Plus: Sport-specific speed source is unverified; refusing a guessed patch."
         )
 
     def fake_version(self, version=None):

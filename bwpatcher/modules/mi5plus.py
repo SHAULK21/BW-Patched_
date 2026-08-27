@@ -22,6 +22,8 @@ from bwpatcher.utils import find_pattern
 
 
 class Mi5plusPatcher(ES32Patcher):
+    """Patcher for Xiaomi Electric Scooter 5 Plus MCU firmware."""
+
     NAME = "Xiaomi Electric Scooter 5 Plus"
 
     # Reverse-engineering map for the supplied mcu_xiaomi.scooter.5plus.bin.
@@ -118,66 +120,91 @@ class Mi5plusPatcher(ES32Patcher):
             return [("region_patch", "already_global", "forced_success", "done")]
         return res
 
+    @staticmethod
+    def _speed_opcode(speed):
+        """Return Thumb MOVS r0,#imm8 encoding for an 8-bit speed parameter."""
+        speed_i = int(round(float(speed)))
+        if not 1 <= speed_i <= 0xFF:
+            raise ValueError("Mi 5 Plus speed parameter must be between 1 and 255")
+        return bytes((speed_i, 0x20))
+
     def _find_verified_speed_hook(self):
-        """Return the unique verified speed-hook offset or raise ValueError."""
+        """Return the unique speed-hook offset and reject ambiguous firmware."""
         sig = list(self.SPEED_PROFILE_LOAD_SIG)
         ofs = find_pattern(self.data, sig)
-        if ofs < 0:
-            raise ValueError("Mi 5 Plus: verified speed signature not found")
 
-        # Do not silently accept a duplicate match if find_pattern's behavior
-        # changes in the future. Check the entire image explicitly.
-        hits = []
-        start = 0
+        # Explicit full-image uniqueness check.  The generic helper intentionally
+        # returns the first match, which is unsafe for a firmware patch point.
         raw = bytes(sig)
         data = bytes(self.data)
+        hits = []
+        start = 0
         while True:
             hit = data.find(raw, start)
             if hit < 0:
                 break
             hits.append(hit)
             start = hit + 1
+
         if len(hits) != 1:
             raise ValueError(
                 f"Mi 5 Plus: speed signature is not unique ({len(hits)} matches)"
             )
-        if hits[0] != self.SPEED_PROFILE_LOAD_OFFSET:
+        if hits[0] != self.SPEED_PROFILE_LOAD_OFFSET or ofs != hits[0]:
             raise ValueError(
                 f"Mi 5 Plus: unexpected speed signature offset 0x{hits[0]:X}"
             )
         return hits[0]
 
-    def _patch_speed_profile(self, speed):
-        speed_i = int(round(float(speed)))
-        if not 1 <= speed_i <= 255:
-            raise ValueError("Mi 5 Plus speed must be between 1 and 255")
-
+    def _find_speed_patch_state(self):
+        """Validate original or already-patched bytes at the verified hook."""
         ofs = self._find_verified_speed_hook()
         value_ofs = ofs + self.SPEED_PROFILE_VALUE_INSN_OFFSET
-        pre = bytes(self.data[value_ofs:value_ofs + 2])
-        expected = bytes((0x78, 0x7A))  # LDRB r0,[r7,#9]
-        if pre != expected:
-            raise ValueError(
-                f"Mi 5 Plus: unexpected instruction at 0x{value_ofs:X}: {pre.hex()}"
-            )
+        current = bytes(self.data[value_ofs:value_ofs + 2])
+        original = bytes((0x78, 0x7A))
 
-        # Thumb: MOVS r0,#imm8 == imm8 20.
-        post = bytes((speed_i, 0x20))
+        if current == original:
+            return ofs, value_ofs, current
+
+        # Once patched, the signature itself necessarily changes at byte +2.
+        # Accept only the exact surrounding bytes with a Thumb MOVS second byte
+        # (0x20). This makes re-patching safe without accepting arbitrary code.
+        if current[1] == 0x20:
+            return ofs, value_ofs, current
+
+        raise ValueError(
+            f"Mi 5 Plus: unexpected instruction at 0x{value_ofs:X}: {current.hex()}"
+        )
+
+    def _patch_speed_profile(self, speed):
+        post = self._speed_opcode(speed)
+        ofs, value_ofs, pre = self._find_speed_patch_state()
+
         self.data[value_ofs:value_ofs + 2] = post
 
         return [
             ("speed_limit_5plus_active_profile",
              hex(value_ofs), pre.hex(), post.hex()),
             ("speed_limit_5plus_source",
-             hex(ofs), expected.hex(), expected.hex()),
+             hex(ofs), bytes(self.SPEED_PROFILE_LOAD_SIG).hex(),
+             bytes(self.SPEED_PROFILE_LOAD_SIG).hex()),
         ]
 
-    def speed_limit_drive(self, speed):
+    def speed_limit_active_profile(self, speed):
         """Patch the verified active-profile speed input.
 
-        Historical API compatibility: this is NOT proven to be Drive-only.
+        This is the preferred API. It does not claim to be Drive-only.
         """
         return self._patch_speed_profile(speed)
+
+    def speed_limit_drive(self, speed):
+        """Compatibility alias for the verified active-profile speed hook.
+
+        The 5 Plus firmware has not yet yielded evidence for a Drive-only
+        storage location, so this method intentionally patches the active
+        profile rather than pretending to target Drive specifically.
+        """
+        return self.speed_limit_active_profile(speed)
 
     def speed_limit_sport(self, speed):
         raise ValueError(

@@ -128,48 +128,51 @@ class Mi5plusPatcher(ES32Patcher):
             raise ValueError("Mi 5 Plus speed parameter must be between 1 and 255")
         return bytes((speed_i, 0x20))
 
-    def _find_verified_speed_hook(self):
-        """Return the unique speed-hook offset and reject ambiguous firmware."""
-        sig = list(self.SPEED_PROFILE_LOAD_SIG)
-        ofs = find_pattern(self.data, sig)
+    def _speed_hook_hits(self):
+        """Find original or already-patched forms of the verified hook.
 
-        # Explicit full-image uniqueness check.  The generic helper intentionally
-        # returns the first match, which is unsafe for a firmware patch point.
-        raw = bytes(sig)
+        Original form:
+            AB 49 78 7A 08 80
+        Patched form:
+            AB 49 XX 20 08 80
+
+        Only byte +2 is variable in the patched form. The surrounding bytes
+        remain a strong anchor, preventing a generic ``XX 20`` search.
+        """
         data = bytes(self.data)
         hits = []
-        start = 0
-        while True:
-            hit = data.find(raw, start)
-            if hit < 0:
-                break
-            hits.append(hit)
-            start = hit + 1
+        for i in range(0, len(data) - 6 + 1):
+            if data[i:i + 2] != b"\xAB\x49":
+                continue
+            if data[i + 4:i + 6] != b"\x08\x80":
+                continue
+            value = data[i + 2:i + 4]
+            if value == b"\x78\x7A" or value[1] == 0x20:
+                hits.append(i)
+        return hits
 
+    def _find_verified_speed_hook(self):
+        """Return the unique verified speed-hook offset or raise on ambiguity."""
+        # Keep the generic signature check for the pristine firmware, but do a
+        # complete scan so patched images can also be safely re-patched.
+        hits = self._speed_hook_hits()
         if len(hits) != 1:
             raise ValueError(
-                f"Mi 5 Plus: speed signature is not unique ({len(hits)} matches)"
+                f"Mi 5 Plus: verified speed hook is ambiguous or missing ({len(hits)} matches)"
             )
-        if hits[0] != self.SPEED_PROFILE_LOAD_OFFSET or ofs != hits[0]:
+        if hits[0] != self.SPEED_PROFILE_LOAD_OFFSET:
             raise ValueError(
                 f"Mi 5 Plus: unexpected speed signature offset 0x{hits[0]:X}"
             )
         return hits[0]
 
     def _find_speed_patch_state(self):
-        """Validate original or already-patched bytes at the verified hook."""
         ofs = self._find_verified_speed_hook()
         value_ofs = ofs + self.SPEED_PROFILE_VALUE_INSN_OFFSET
         current = bytes(self.data[value_ofs:value_ofs + 2])
         original = bytes((0x78, 0x7A))
 
-        if current == original:
-            return ofs, value_ofs, current
-
-        # Once patched, the signature itself necessarily changes at byte +2.
-        # Accept only the exact surrounding bytes with a Thumb MOVS second byte
-        # (0x20). This makes re-patching safe without accepting arbitrary code.
-        if current[1] == 0x20:
+        if current == original or current[1] == 0x20:
             return ofs, value_ofs, current
 
         raise ValueError(

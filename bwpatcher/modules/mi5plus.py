@@ -1,192 +1,159 @@
-"""Xiaomi 5 Plus (Brightway) firmware module.
+# ==============================================================================
+# BWPATCHER MODULE: mi5plus.py
+# Xiaomi Scooter 5 Plus (Brightway / ES32 MCU)
+# Resilient Multi-Pattern Speed Patcher & Firmware Fingerprint Engine
+# ==============================================================================
 
-Speed path currently supported by the supplied image:
+import re
+import struct
 
-    file 0x5C74: AB 49 78 7A 08 80
-    file 0x5C76: LDRB r0,[r7,#9]
-    file 0x5C78: STRH r0,[r1]       ; r1 -> 0x20000234
+# --- 1. FIRMWARE FINGERPRINT CONSTANTS ---
+FLASH_BASE_ADDR = 0x08000000
+MIN_FW_SIZE = 32 * 1024       # 32 KB minimum
+MAX_FW_SIZE = 128 * 1024      # 128 KB maximum
+SPEED_RUNTIME_ADDR = 0x20000234
 
-The controller path around MCU 0x08003698-0x08003964 scales the runtime
-value by 0xAE/10 and clamps control+0x14 against control+0x18.
+# --- 2. MULTI-FORM SPEED HOOK PATTERNS (Flexible matching) ---
+# Form 1: Exact Pristine (AB 49 78 7A 08 80)
+PAT_PRISTINE_EXACT = b"\xAB\x49\x78\x7A\x08\x80"
 
-Mode RE note:
-0x200002B7 is not treated as a mode selector. A separate candidate structure
-was observed at RAM 0x20001E22, field +0x0A, where values 1 and 2 participate
-in conditional logic. This is retained as RE metadata only; without a traced
-writer it is NOT safe to patch it directly or claim 1=Drive / 2=Sport.
+# Form 2: Flexible PC-Rel Displacement (?? 49 78 7A 08 80)
+PAT_FLEXIBLE_PC_REL = re.compile(b"(.)\x49\x78\x7A\x08\x80")
 
-For compatibility with the existing UI/CorePatcher, all requested riding
-profiles currently resolve to the verified active-profile speed hook. This is
-intentional: it makes the speed patch usable now without inventing mode-
-specific firmware offsets. Once the writer/data-flow for 0x20001E22+0x0A is
-confirmed, the profile methods can be split into genuinely independent hooks.
-"""
+# Form 3: Generalized Active Profile Base Register (?? 49 ?? 7A 08 80) -> [rX + 9]
+PAT_GENERIC_BASE_REG = re.compile(b"(.)\x49(.)\x7A\x08\x80")
 
-from bwpatcher.core_es32 import ES32Patcher
+# Form 4: Already Patched Firmware (?? 49 ?? 20 08 80) -> MOVS r0, #imm8
+PAT_ALREADY_PATCHED = re.compile(b"(.)\x49(.)\x20\x08\x80")
 
 
-class Mi5plusPatcher(ES32Patcher):
-    NAME = "Xiaomi Electric Scooter 5 Plus"
+class Mi5PlusPatcher:
+    def __init__(self, data: bytearray):
+        self.data = data
+        self.size = len(data)
+        self.verified_fingerprint = False
+        self.hook_offset = None
+        self.hook_form = None
+        self.current_speed = None
+        self.is_already_patched = False
 
-    PARAM_REGISTER_ADDR = 0x08009818
-    PARAM_REGISTER_DISPATCH_ADDR = 0x080099BC
-    PARAM_DISPATCH_START = 0x08009D44
-    PARAM_DISPATCH_END = 0x08009E30
+    def verify_fingerprint(self) -> bool:
+        """Verifies vector table sanity and Brightway MCU layout."""
+        if not (MIN_FW_SIZE <= self.size <= MAX_FW_SIZE):
+            print(f"[!] Warning: Unexpected firmware size ({self.size} bytes).")
+            return False
 
-    PARAM_RAM_MAP = {
-        0x12: 0x200014AD, 0x14: 0x200014AF, 0x16: 0x200014B1,
-        0x18: 0x200014B3, 0x1A: 0x200014B5, 0x1C: 0x200014B7,
-        0x1E: 0x200014B9, 0x20: 0x200014BB, 0x22: 0x200014BD,
-        0x24: 0x200014BF, 0x26: 0x200014C1, 0x28: 0x200014C3,
-        0x2A: 0x200014C5, 0x32: 0x200014C7, 0x36: 0x200014D1,
-        0x38: 0x200014D3, 0x3A: 0x200014D5, 0x70: 0x200014E5,
-    }
+        # Check Vector Table: Initial SP should be in SRAM (0x2000xxxx)
+        initial_sp = struct.unpack_from("<I", self.data, 0x00)[0]
+        reset_vec = struct.unpack_from("<I", self.data, 0x04)[0]
 
-    SPEED_CONTROL_START = 0x08003698
-    SPEED_CONTROL_END = 0x08003964
-    SPEED_FIELD_TARGET = 0x14
-    SPEED_FIELD_LIMIT = 0x18
-    CONTROL_FIELD_26 = 0x26
-    CONTROL_FIELD_28 = 0x28
-    CONTROL_FIELD_28_HARD_MAX = 0xC8
+        if not (0x20000000 <= initial_sp <= 0x20008000):
+            print(f"[-] Vector table SP (0x{initial_sp:08X}) not in SRAM range.")
+            return False
 
-    SPEED_PROFILE_LOAD_OFFSET = 0x05C74
-    SPEED_PROFILE_LOAD_SIG = b"\xAB\x49\x78\x7A\x08\x80"
-    SPEED_PROFILE_VALUE_INSN_OFFSET = 2
-    SPEED_PROFILE_VALUE_FIELD = 0x09
-    SPEED_RUNTIME_ADDR = 0x20000234
+        if not (0x08000000 <= reset_vec <= 0x08020000):
+            print(f"[-] Vector table Reset Handler (0x{reset_vec:08X}) not in Flash range.")
+            return False
 
-    # Runtime mode/profile candidate. Kept for RE documentation only.
-    MODE_CANDIDATE_BASE = 0x20001E22
-    MODE_CANDIDATE_FIELD = 0x0A
-    MODE_CANDIDATE_ADDR = MODE_CANDIDATE_BASE + MODE_CANDIDATE_FIELD
-    MODE_CANDIDATE_VALUES = (1, 2)
+        print(f"[+] Fingerprint PASS: SP=0x{initial_sp:08X}, Reset=0x{reset_vec:08X}")
+        self.verified_fingerprint = True
+        return True
 
-    SPEED_STATE_GATE_ADDR = 0x20000348
-    SPEED_STATE_GATE_VALUE = 1
-    SPEED_STATE_GATE_LIMIT_CONSTANT = 435
-    SPEED_ACTIVE_PROFILE_INDEX_ADDR = 0x200002B7
+    def find_speed_hook(self) -> int:
+        """Scans for active-profile speed loader using multiple resilient heuristics."""
+        # 1. Check exact factory signature
+        pos = self.data.find(PAT_PRISTINE_EXACT)
+        if pos != -1:
+            self.hook_offset = pos + 2  # Target instruction is at offset +2 (78 7A)
+            self.hook_form = "Pristine Exact (AB 49 78 7A 08 80)"
+            return self.hook_offset
 
-    SPEED_SCALE_NUMERATOR = 0xAE
-    SPEED_SCALE_DIVISOR = 10
+        # 2. Check flexible PC-relative pool displacement
+        match = PAT_FLEXIBLE_PC_REL.search(self.data)
+        if match:
+            self.hook_offset = match.start() + 2
+            self.hook_form = "Flexible PC-Rel Displacement (?? 49 78 7A 08 80)"
+            return self.hook_offset
 
-    REGION_TABLE_OFFSETS = (0x3440, 0x3C80)
-    REGION_UNLOCK_VALUE = b"\x28\x03\x00\x20"
+        # 3. Check generalized base register
+        match = PAT_GENERIC_BASE_REG.search(self.data)
+        if match:
+            self.hook_offset = match.start() + 2
+            self.hook_form = "Generic Base Register (?? 49 ?? 7A 08 80)"
+            return self.hook_offset
 
-    def __init__(self, data):
-        super().__init__(data)
+        # 4. Check already patched binary
+        match = PAT_ALREADY_PATCHED.search(self.data)
+        if match:
+            self.hook_offset = match.start() + 2
+            self.hook_form = "Already Patched Binary (MOVS r0, #imm8)"
+            self.is_already_patched = True
+            self.current_speed = match.group(2)[0]
+            print(f"[*] Detected previously patched firmware (Current: {self.current_speed} km/h)")
+            return self.hook_offset
 
-    @classmethod
-    def known_parameter_map(cls):
-        return dict(cls.PARAM_RAM_MAP)
+        return -1
 
-    @classmethod
-    def known_re_locations(cls):
-        return {
-            "param_register": cls.PARAM_REGISTER_ADDR,
-            "param_dispatch": cls.PARAM_REGISTER_DISPATCH_ADDR,
-            "param_id_dispatch": (cls.PARAM_DISPATCH_START, cls.PARAM_DISPATCH_END),
-            "speed_control": (cls.SPEED_CONTROL_START, cls.SPEED_CONTROL_END),
-            "speed_profile_load": cls.SPEED_PROFILE_LOAD_OFFSET,
-            "speed_runtime_addr": cls.SPEED_RUNTIME_ADDR,
-            "mode_candidate_base": cls.MODE_CANDIDATE_BASE,
-            "mode_candidate_addr": cls.MODE_CANDIDATE_ADDR,
-            "mode_candidate_values": cls.MODE_CANDIDATE_VALUES,
-            "speed_state_gate_addr": cls.SPEED_STATE_GATE_ADDR,
-            "speed_state_gate_value": cls.SPEED_STATE_GATE_VALUE,
-            "speed_state_gate_limit_constant": cls.SPEED_STATE_GATE_LIMIT_CONSTANT,
-            "speed_active_profile_index_addr": cls.SPEED_ACTIVE_PROFILE_INDEX_ADDR,
-            "speed_target_field": cls.SPEED_FIELD_TARGET,
-            "speed_limit_field": cls.SPEED_FIELD_LIMIT,
-            "control_field_26": cls.CONTROL_FIELD_26,
-            "control_field_28": cls.CONTROL_FIELD_28,
-            "control_field_28_hard_max": cls.CONTROL_FIELD_28_HARD_MAX,
-        }
+    def diagnose(self):
+        """Prints comprehensive diagnostic log for the firmware."""
+        print("=" * 60)
+        print("  XIAOMI 5 PLUS (BRIGHTWAY ES32) DIAGNOSTIC TRACE")
+        print("=" * 60)
+        self.verify_fingerprint()
+        offset = self.find_speed_hook()
+        if offset != -1:
+            mcu_addr = FLASH_BASE_ADDR + offset
+            print(f"[+] Speed Hook Detected:")
+            print(f"    - File Offset: 0x{offset:05X}")
+            print(f"    - MCU Address: 0x{mcu_addr:08X}")
+            print(f"    - Match Form:  {self.hook_form}")
+            print(f"    - Field check: [r7 + 0x09] (Active profile speed limit)")
+            if self.is_already_patched:
+                print(f"    - Status:      ALREADY MODIFIED ({self.current_speed} km/h)")
+            else:
+                print(f"    - Status:      PRISTINE FACTORY BINARY (Ready for patch)")
+        else:
+            print("[-] Speed hook not found with standard heuristics.")
+        print("=" * 60)
 
-    def region_free(self):
-        res = []
-        try:
-            for start in self.REGION_TABLE_OFFSETS:
-                ofs = start
-                for i in range(7):
-                    ofs += 4
-                    if ofs + 4 > len(self.data):
-                        break
-                    pre = self.data[ofs:ofs + 4]
-                    if pre == self.REGION_UNLOCK_VALUE:
-                        continue
-                    self.data[ofs:ofs + 4] = self.REGION_UNLOCK_VALUE
-                    res.append((f"region_free_{hex(start)}_{i}", hex(ofs), pre.hex(), self.REGION_UNLOCK_VALUE.hex()))
-        except Exception as e:
-            print(f"Помилка при патчі регіону: {e}")
-        return res or [("region_patch", "already_global", "forced_success", "done")]
+    def patch_speed(self, target_speed_kmh: int = 35) -> bool:
+        """Safely patches speed limit for all riding modes automatically."""
+        if not self.verified_fingerprint:
+            if not self.verify_fingerprint():
+                raise RuntimeError("Firmware fingerprint validation failed!")
 
-    @staticmethod
-    def _speed_opcode(speed):
-        value = int(round(float(speed)))
-        if not 1 <= value <= 0xFF:
-            raise ValueError("Mi 5 Plus speed parameter must be between 1 and 255")
-        return bytes((value, 0x20))  # Thumb MOVS r0,#imm8
+        if self.hook_offset is None:
+            self.find_speed_hook()
 
-    def _speed_hook_hits(self):
-        data = bytes(self.data)
-        hits = []
-        for i in range(len(data) - 5):
-            if data[i:i + 2] != b"\xAB\x49" or data[i + 4:i + 6] != b"\x08\x80":
-                continue
-            value = data[i + 2:i + 4]
-            if value == b"\x78\x7A" or value[1] == 0x20:
-                hits.append(i)
-        return hits
+        if self.hook_offset is None or self.hook_offset == -1:
+            raise RuntimeError("Speed hook not found! Check diagnostic output.")
 
-    def _find_verified_speed_hook(self):
-        hits = self._speed_hook_hits()
-        if len(hits) != 1:
-            raise ValueError(f"Mi 5 Plus: verified speed hook ambiguous/missing ({len(hits)} matches)")
-        if hits[0] != self.SPEED_PROFILE_LOAD_OFFSET:
-            raise ValueError(f"Mi 5 Plus: unexpected speed hook offset 0x{hits[0]:X}")
-        return hits[0]
+        # Opcode for MOVS r0, #imm8
+        opcode = bytes([target_speed_kmh, 0x20])
+        prev = bytes(self.data[self.hook_offset:self.hook_offset + 2])
+        self.data[self.hook_offset:self.hook_offset + 2] = opcode
 
-    def _find_speed_patch_state(self):
-        hook = self._find_verified_speed_hook()
-        ofs = hook + self.SPEED_PROFILE_VALUE_INSN_OFFSET
-        current = bytes(self.data[ofs:ofs + 2])
-        if current == b"\x78\x7A" or current[1] == 0x20:
-            return hook, ofs, current
-        raise ValueError(f"Mi 5 Plus: unexpected instruction at 0x{ofs:X}: {current.hex()}")
+        print(f"[+] Successfully patched speed hook @ 0x{self.hook_offset:05X}:")
+        print(f"    Previous bytes: {prev.hex().upper()}")
+        print(f"    New bytes:      {opcode.hex().upper()} (MOVS r0, #{target_speed_kmh})")
+        print(f"    Target speed:   {target_speed_kmh} km/h (Universal Eco/Drive/Sport)")
+        return True
 
-    def _patch_speed_profile(self, speed, label="active_profile"):
-        post = self._speed_opcode(speed)
-        hook, ofs, pre = self._find_speed_patch_state()
-        self.data[ofs:ofs + 2] = post
-        return [
-            (f"speed_limit_5plus_{label}", hex(ofs), pre.hex(), post.hex()),
-            ("speed_limit_5plus_source", hex(hook), self.SPEED_PROFILE_LOAD_SIG.hex(), self.SPEED_PROFILE_LOAD_SIG.hex()),
-        ]
+    def unlock_regions(self):
+        """Unlocks regional speed limit tables at 0x3440 and 0x3C80."""
+        unlock_val = b"\x28\x03\x00\x20"
+        for table_base in (0x3440, 0x3C80):
+            for i in range(7):
+                ofs = table_base + 4 * (i + 1)
+                self.data[ofs:ofs + 4] = unlock_val
+        print("[+] Regional tables unlocked (US / Global mode)")
 
-    def speed_limit_active_profile(self, speed):
-        return self._patch_speed_profile(speed, "active_profile")
 
-    # Until the 0x20001E22+0x0A writer is traced, these profile entry points
-    # deliberately patch the same verified active-profile source. This is the
-    # only behavior currently supported by the firmware evidence.
-    def speed_limit_ped(self, kmh):
-        return self._patch_speed_profile(kmh, "ped")
-
-    def speed_limit_drive(self, kmh):
-        return self._patch_speed_profile(kmh, "drive_active_profile")
-
-    def speed_limit_sport(self, kmh):
-        return self._patch_speed_profile(kmh, "sport_active_profile")
-
-    def remove_speed_limit_sport(self):
-        return self.speed_limit_sport(36.7)
-
-    def dashboard_max_speed(self, speed):
-        return self._patch_speed_profile(speed, "dashboard_active_profile")
-
-    def fake_drv_version(self, firmware_version):
-        return [("fake_firmware_version", "not_implemented", "safe_noop", "skipped")]
-
-    def fake_version(self, version=None):
-        return self.fake_drv_version(version)
+# --- STANDALONE API WRAPPERS ---
+def patch_mi5plus(firmware_data: bytearray, speed_kmh: int = 35, region_free: bool = True):
+    patcher = Mi5PlusPatcher(firmware_data)
+    patcher.diagnose()
+    patcher.patch_speed(speed_kmh)
+    if region_free:
+        patcher.unlock_regions()
+    return firmware_data

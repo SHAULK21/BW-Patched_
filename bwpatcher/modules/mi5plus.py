@@ -1,17 +1,25 @@
-"""Xiaomi 5 Plus speed patcher.
+"""Xiaomi 5 Plus (Brightway) firmware module.
 
-Verified path for the supplied image:
-file 0x5C74: AB 49 78 7A 08 80
-file 0x5C76: LDRB r0,[r7,#9]
-file 0x5C78: STRH r0,[r1], r1 -> 0x20000234
+Speed path currently supported by the supplied image:
 
-The controller at MCU 0x08003698 scales the runtime value by 0xAE/10,
-stores it at control+0x18, slews control+0x14 and clamps +0x14 to +0x18.
-A separate gate at 0x0800373E reads 0x20000348; value 1 selects constant
-435 instead of the scaled value. This gate is real, but its meaning is not
-yet proven to be Eco/Drive/Sport.
+    file 0x5C74: AB 49 78 7A 08 80
+    file 0x5C76: LDRB r0,[r7,#9]
+    file 0x5C78: STRH r0,[r1]       ; r1 -> 0x20000234
 
-0x200002B7 is not treated as a mode selector.
+The controller path around MCU 0x08003698-0x08003964 scales the runtime
+value by 0xAE/10 and clamps control+0x14 against control+0x18.
+
+Mode RE note:
+0x200002B7 is not treated as a mode selector. A separate candidate structure
+was observed at RAM 0x20001E22, field +0x0A, where values 1 and 2 participate
+in conditional logic. This is retained as RE metadata only; without a traced
+writer it is NOT safe to patch it directly or claim 1=Drive / 2=Sport.
+
+For compatibility with the existing UI/CorePatcher, all requested riding
+profiles currently resolve to the verified active-profile speed hook. This is
+intentional: it makes the speed patch usable now without inventing mode-
+specific firmware offsets. Once the writer/data-flow for 0x20001E22+0x0A is
+confirmed, the profile methods can be split into genuinely independent hooks.
 """
 
 from bwpatcher.core_es32 import ES32Patcher
@@ -48,6 +56,12 @@ class Mi5plusPatcher(ES32Patcher):
     SPEED_PROFILE_VALUE_FIELD = 0x09
     SPEED_RUNTIME_ADDR = 0x20000234
 
+    # Runtime mode/profile candidate. Kept for RE documentation only.
+    MODE_CANDIDATE_BASE = 0x20001E22
+    MODE_CANDIDATE_FIELD = 0x0A
+    MODE_CANDIDATE_ADDR = MODE_CANDIDATE_BASE + MODE_CANDIDATE_FIELD
+    MODE_CANDIDATE_VALUES = (1, 2)
+
     SPEED_STATE_GATE_ADDR = 0x20000348
     SPEED_STATE_GATE_VALUE = 1
     SPEED_STATE_GATE_LIMIT_CONSTANT = 435
@@ -75,6 +89,9 @@ class Mi5plusPatcher(ES32Patcher):
             "speed_control": (cls.SPEED_CONTROL_START, cls.SPEED_CONTROL_END),
             "speed_profile_load": cls.SPEED_PROFILE_LOAD_OFFSET,
             "speed_runtime_addr": cls.SPEED_RUNTIME_ADDR,
+            "mode_candidate_base": cls.MODE_CANDIDATE_BASE,
+            "mode_candidate_addr": cls.MODE_CANDIDATE_ADDR,
+            "mode_candidate_values": cls.MODE_CANDIDATE_VALUES,
             "speed_state_gate_addr": cls.SPEED_STATE_GATE_ADDR,
             "speed_state_gate_value": cls.SPEED_STATE_GATE_VALUE,
             "speed_state_gate_limit_constant": cls.SPEED_STATE_GATE_LIMIT_CONSTANT,
@@ -109,7 +126,7 @@ class Mi5plusPatcher(ES32Patcher):
         value = int(round(float(speed)))
         if not 1 <= value <= 0xFF:
             raise ValueError("Mi 5 Plus speed parameter must be between 1 and 255")
-        return bytes((value, 0x20))  # MOVS r0,#imm8
+        return bytes((value, 0x20))  # Thumb MOVS r0,#imm8
 
     def _speed_hook_hits(self):
         data = bytes(self.data)
@@ -150,9 +167,9 @@ class Mi5plusPatcher(ES32Patcher):
     def speed_limit_active_profile(self, speed):
         return self._patch_speed_profile(speed, "active_profile")
 
-    # CorePatcher requires these methods. Until independent mode storage is
-    # proven, all three use the verified active-profile hook rather than a
-    # fabricated mode-specific address.
+    # Until the 0x20001E22+0x0A writer is traced, these profile entry points
+    # deliberately patch the same verified active-profile source. This is the
+    # only behavior currently supported by the firmware evidence.
     def speed_limit_ped(self, kmh):
         return self._patch_speed_profile(kmh, "ped")
 

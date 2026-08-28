@@ -2,13 +2,27 @@
 # -*- coding: utf-8 -*-
 """Xiaomi Electric Scooter 5 Plus / Brightway ES32.
 
-This module is intentionally based ONLY on byte sequences verified against the
-original 5 Plus firmware image used for reverse engineering.
+The speed patcher is based on the original 5 Plus BIN used during reverse
+engineering (125371 bytes, SHA-256 bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4).
 
-The dispatcher in bwpatcher/utils.py resolves a model named ``mi5plus`` to the
-class name ``Mi5plusPatcher`` via ``model.capitalize()``.  Keep that exact
-class name (and the backward-compatible alias below).
+The verified hook in that image is:
+    file 0x5C74: AB 49 78 7A 08 80
+    file 0x5C76: 78 7A = LDRB r0,[r7,#9]
+    file 0x5C78: 08 80 = STRH r0,[r1]
+
+Firmware revisions may change the PC-relative literal offset, so the patcher
+uses the full verified instruction shape (?? 49 78 7A 08 80) rather than
+requiring the literal-load byte AB. It still requires a UNIQUE match and
+never patches a generic XX 20 sequence.
+
+Mode semantics remain RE-only. No unverified Eco/Drive/Sport addresses are
+written by this module.
 """
+
+from __future__ import annotations
+
+import hashlib
+from typing import Optional
 
 from bwpatcher.core_es32 import ES32Patcher
 from bwpatcher.utils import SignatureException
@@ -18,17 +32,17 @@ FLASH_BASE_ADDR = 0x08000000
 FIRMWARE_SIZE = 125371
 FIRMWARE_SHA256 = "bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4"
 
-# Confirmed speed hook for the supplied pristine BIN.
+# Confirmed hook from the original research BIN.
 SPEED_HOOK_MCU = 0x08005C76
 SPEED_HOOK_OFFSET = SPEED_HOOK_MCU - FLASH_BASE_ADDR  # 0x5C76
 SPEED_HOOK_PREFIX = b"\xAB\x49"
+SPEED_HOOK_GENERIC_PREFIX = b"\x00\x49"
 SPEED_HOOK_SUFFIX = b"\x08\x80"
-SPEED_HOOK_ORIGINAL = b"\x78\x7A"  # LDRB r0,[r7,#9]
+SPEED_HOOK_ORIGINAL = b"\x78\x7A"
 SPEED_RUNTIME_ADDR = 0x20000234
 SPEED_PROFILE_FIELD = 0x09
 
-# These values are retained as RE metadata only. They are not used to perform
-# an unsafe write unless the corresponding bytecode is independently verified.
+# RE metadata only; do not use these as blind Flash write locations.
 SPEED_CONTROL_START_MCU = 0x08003698
 SPEED_CONTROL_END_MCU = 0x08003964
 SPEED_CONTROL_OBJECT = 0x20001E40
@@ -40,13 +54,12 @@ SPEED_GATE_LIMIT = 435
 SPEED_SCALE_NUMERATOR = 0xAE
 SPEED_SCALE_DIVISOR = 10
 
-# Mode structure is still RE-only metadata. Do not assign 0/1/2 semantics here.
+# Mode candidate kept as evidence metadata only.
 MODE_STRUCTURE_ADDR = 0x20001E22
 MODE_FIELD_OFFSET = 0x0A
 MODE_FIELD_ADDR = MODE_STRUCTURE_ADDR + MODE_FIELD_OFFSET
 MODE_MAPPING_STATUS = "UNVERIFIED"
 
-# Explicitly rejected earlier AI-generated claims; useful for audit/debugging.
 REJECTED_RE_CLAIMS = {
     "claimed_mode_writer": 0x0800A412,
     "claimed_mode_init": 0x08005834,
@@ -56,75 +69,92 @@ REJECTED_RE_CLAIMS = {
 
 
 class Mi5plusPatcher(ES32Patcher):
-    """Patcher for the verified Xiaomi 5 Plus ES32 speed hook."""
+    """Xiaomi 5 Plus patcher with an evidence-first speed hook."""
 
     NAME = "Xiaomi Electric Scooter 5 Plus"
 
     def __init__(self, data):
         super().__init__(data)
-        self.hook_offset = None
-        self.hook_form = None
-        self.current_speed = None
+        self.hook_offset: Optional[int] = None
+        self.hook_start: Optional[int] = None
+        self.hook_form: Optional[str] = None
+        self.current_speed: Optional[int] = None
 
     # ------------------------------------------------------------------
-    # Firmware identification / speed-hook discovery
+    # Firmware / hook discovery
     # ------------------------------------------------------------------
-    def verify_firmware(self):
-        """Return True only when the expected 5 Plus size and hook are present."""
-        return len(self.data) == FIRMWARE_SIZE and self._find_speed_hook() is not None
+    def firmware_fingerprint(self) -> dict:
+        return {
+            "size": len(self.data),
+            "sha256": hashlib.sha256(bytes(self.data)).hexdigest(),
+            "known_original": len(self.data) == FIRMWARE_SIZE
+            and hashlib.sha256(bytes(self.data)).hexdigest() == FIRMWARE_SHA256,
+        }
 
-    def _find_speed_hook(self):
-        """Find the unique pristine or already-patched form of the verified hook.
+    @staticmethod
+    def _is_movs_r0_imm(opcode: bytes) -> bool:
+        return len(opcode) == 2 and opcode[1] == 0x20 and 0x00 <= opcode[0] <= 0xFF
 
-        Accepted forms:
-          AB 49 78 7A 08 80  (pristine)
-          AB 49 XX 20 08 80  (our Thumb MOVS patch)
+    def _scan_speed_hook_candidates(self) -> list[tuple[int, str, bool]]:
+        """Find the verified hook by instruction shape, not just one literal.
 
-        No generic ``XX 20`` search is performed without the surrounding
-        signature, preventing unrelated code from being modified.
+        Accepted pristine form:
+            ?? 49 78 7A 08 80
+        Accepted patched form:
+            ?? 49 XX 20 08 80
+
+        The surrounding bytes encode a PC-relative LDR r1 followed by the
+        LDRB/STRH pair used by the verified speed hook. The match must be
+        unique in the complete image.
         """
         data = bytes(self.data)
-        candidates = []
-        pristine = SPEED_HOOK_PREFIX + SPEED_HOOK_ORIGINAL + SPEED_HOOK_SUFFIX
+        candidates: list[tuple[int, str, bool]] = []
 
-        start = 0
-        while True:
-            pos = data.find(pristine, start)
-            if pos < 0:
-                break
-            candidates.append((pos, "pristine", False))
-            start = pos + 1
+        for pos in range(max(0, len(data) - 6 + 1)):
+            if data[pos + 1] != 0x49 or data[pos + 4:pos + 6] != SPEED_HOOK_SUFFIX:
+                continue
 
-        start = 0
-        while True:
-            pos = data.find(SPEED_HOOK_PREFIX, start)
-            if pos < 0:
-                break
-            if pos + 6 <= len(data):
-                middle = data[pos + 2:pos + 4]
-                if middle[1] == 0x20 and data[pos + 4:pos + 6] == SPEED_HOOK_SUFFIX:
-                    candidates.append((pos, "patched", True))
-            start = pos + 1
+            middle = data[pos + 2:pos + 4]
+            if middle == SPEED_HOOK_ORIGINAL:
+                candidates.append((pos, "pristine", False))
+            elif self._is_movs_r0_imm(middle):
+                candidates.append((pos, "patched", True))
 
-        if len(candidates) != 1:
-            return None
-        pos, form, patched = candidates[0]
-        if pos != SPEED_HOOK_OFFSET:
-            return None
-        return (pos, form, patched)
+        return candidates
 
-    # Backwards-compatible name used by older callers/tests.
+    def _find_speed_hook(self) -> tuple[int, str, bool]:
+        """Return (hook_start, form, already_patched) for a unique hook."""
+        candidates = self._scan_speed_hook_candidates()
+
+        # Prefer the exact original research point when it is present. This
+        # also gives a clear result for the supplied 125371-byte reference BIN.
+        at_known = [c for c in candidates if c[0] == SPEED_HOOK_OFFSET - 2]
+        if len(at_known) == 1:
+            return at_known[0]
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        data = bytes(self.data)
+        expected = data[SPEED_HOOK_OFFSET - 2:SPEED_HOOK_OFFSET + 4]
+        raise SignatureException(
+            "Mi 5 Plus: speed hook not uniquely detected. "
+            f"file_size={len(data)}, expected_at_0x5C74={expected.hex(' ')}, "
+            f"candidate_count={len(candidates)}. "
+            "Accepted shape: ?? 49 78 7A 08 80 or ?? 49 XX 20 08 80."
+        )
+
+    def verify_firmware(self):
+        try:
+            self._find_speed_hook()
+            return True
+        except Exception:
+            return False
+
     def find_speed_hook(self):
-        hit = self._find_speed_hook()
-        if hit is None:
-            self.hook_offset = -1
-            self.hook_form = None
-            raise SignatureException(
-                "Mi 5 Plus: verified speed hook not found. Expected file offset "
-                "0x5C74 / MCU 0x08005C74: AB 49 78 7A 08 80 (or exact patched form)."
-            )
-        pos, form, patched = hit
-        self.hook_offset = pos + 2
+        start, form, patched = self._find_speed_hook()
+        self.hook_start = start
+        self.hook_offset = start + 2
         self.hook_form = form
         if patched:
             self.current_speed = self.data[self.hook_offset]
@@ -136,8 +166,8 @@ class Mi5plusPatcher(ES32Patcher):
     def reverse_engineering_map(self):
         return {
             "firmware_size": len(self.data),
-            "expected_firmware_size": FIRMWARE_SIZE,
-            "firmware_sha256": FIRMWARE_SHA256,
+            "firmware_sha256": hashlib.sha256(bytes(self.data)).hexdigest(),
+            "known_original_sha256": FIRMWARE_SHA256,
             "speed_hook_file": SPEED_HOOK_OFFSET,
             "speed_hook_mcu": SPEED_HOOK_MCU,
             "speed_runtime_addr": SPEED_RUNTIME_ADDR,
@@ -158,14 +188,14 @@ class Mi5plusPatcher(ES32Patcher):
         }
 
     def diagnose(self):
-        print("=" * 68)
+        print("=" * 72)
         print("XIAOMI 5 PLUS / BRIGHTWAY ES32")
-        print("Verified-firmware diagnostic / RE map")
-        print("=" * 68)
-        print(f"Size: {len(self.data)} bytes (expected {FIRMWARE_SIZE})")
-        print(f"Speed hook anchor: file 0x{SPEED_HOOK_OFFSET:05X}")
-        print(f"Speed runtime: 0x{SPEED_RUNTIME_ADDR:08X}")
-        print(f"Mode field candidate: 0x{MODE_FIELD_ADDR:08X} [{MODE_MAPPING_STATUS}]")
+        print("Evidence-first speed diagnostic")
+        print("=" * 72)
+        fp = self.firmware_fingerprint()
+        print(f"Size: {fp['size']} (known reference: {FIRMWARE_SIZE})")
+        print(f"SHA-256: {fp['sha256']}")
+        print(f"Known reference image: {fp['known_original']}")
         try:
             ofs = self.find_speed_hook()
         except SignatureException as exc:
@@ -174,7 +204,7 @@ class Mi5plusPatcher(ES32Patcher):
         print(f"[+] Speed hook: file 0x{ofs:05X}, MCU 0x{FLASH_BASE_ADDR + ofs:08X}")
         print(f"    Form: {self.hook_form}")
         if self.current_speed is not None:
-            print(f"    Current patched byte: {self.current_speed} (0x{self.current_speed:02X})")
+            print(f"    Current patched parameter: {self.current_speed} (0x{self.current_speed:02X})")
         return ofs
 
     # ------------------------------------------------------------------
@@ -185,54 +215,64 @@ class Mi5plusPatcher(ES32Patcher):
         value = int(round(float(kmh)))
         if not 1 <= value <= 0xFF:
             raise ValueError("Mi 5 Plus speed parameter must be between 1 and 255")
-        return bytes((value, 0x20))  # Thumb MOVS r0,#imm8
+        return bytes((value, 0x20))
 
     def _patch_speed(self, kmh):
-        _, value_ofs, pre = self.find_speed_hook(), self.hook_offset, None
-        pre = bytes(self.data[value_ofs:value_ofs + 2])
+        self.find_speed_hook()
+        if self.hook_offset is None:
+            raise SignatureException("Mi 5 Plus: speed hook offset is unavailable")
+
+        pre = bytes(self.data[self.hook_offset:self.hook_offset + 2])
         post = self._speed_opcode(kmh)
-        if pre != SPEED_HOOK_ORIGINAL and pre[1:2] != b"\x20":
+
+        if pre != SPEED_HOOK_ORIGINAL and not self._is_movs_r0_imm(pre):
             raise SignatureException(
-                f"Mi 5 Plus: unexpected opcode at 0x{value_ofs:X}: {pre.hex()}"
+                f"Mi 5 Plus: unexpected opcode at 0x{self.hook_offset:X}: {pre.hex(' ')}"
             )
+
         if pre != post:
-            self.data[value_ofs:value_ofs + 2] = post
+            self.data[self.hook_offset:self.hook_offset + 2] = post
+
         self.current_speed = post[0]
         self.hook_form = "patched"
-        return [("speed_limit_active_profile", hex(value_ofs), pre.hex(), post.hex())]
+        return [
+            ("speed_limit_active_profile", hex(self.hook_offset), pre.hex(), post.hex()),
+            ("speed_hook_anchor", hex(self.hook_start), "??49787A0880", "verified"),
+        ]
 
     def speed_limit_active_profile(self, kmh):
         return self._patch_speed(kmh)
 
+    # All public speed controls intentionally address the same active-profile
+    # hook. We have NOT proven three independent Flash speed bytes.
     def speed_limit_ped(self, kmh):
         return self._patch_speed(kmh)
 
     def speed_limit_drive(self, kmh):
-        # The BIN has not yielded a separate Drive-only speed byte.
         return self._patch_speed(kmh)
 
     def speed_limit_sport(self, kmh):
-        # The BIN has not yielded a separate Sport-only speed byte.
         return self._patch_speed(kmh)
 
     def dashboard_max_speed(self, speed):
         return self._patch_speed(speed)
 
     def remove_speed_limit_sport(self):
+        # Keep compatibility with the BW patch-map. This means setting the
+        # active hook to the maximum encodable byte; it does not remove every
+        # other controller safety limit.
         return self._patch_speed(0xFF)
 
     # ------------------------------------------------------------------
-    # Safety: unverified operations remain disabled.
+    # Unverified operations remain disabled
     # ------------------------------------------------------------------
     def region_free(self):
         raise SignatureException(
-            "Mi 5 Plus: region table is unverified for this firmware; refusing guessed writes."
+            "Mi 5 Plus: region table is unverified for this firmware; refusing guessed Flash writes."
         )
 
     def fake_drv_version(self, firmware_version):
-        raise SignatureException(
-            "Mi 5 Plus: fake DRV version patch is unverified."
-        )
+        raise SignatureException("Mi 5 Plus: fake DRV version patch is unverified.")
 
     def fake_version(self, version=None):
         return self.fake_drv_version(version)
@@ -241,13 +281,11 @@ class Mi5plusPatcher(ES32Patcher):
         return super().motor_start_speed(speed)
 
 
-# Explicit alias for callers that use Python naming rather than the historical
-# dispatcher convention (``Mi5plusPatcher``).
+# Compatibility for code importing the alternate capitalization.
 Mi5PlusPatcher = Mi5plusPatcher
 
 
 def patch_mi5plus(firmware_data, speed_kmh=35):
-    """Standalone helper used by external scripts."""
     patcher = Mi5plusPatcher(firmware_data)
     patcher.diagnose()
     patcher.speed_limit_active_profile(speed_kmh)

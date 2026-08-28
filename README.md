@@ -25,7 +25,7 @@ This tool does not flash the scooter directly. The flashing process requires a t
 
 ## Setup
 
-This patcher requires Python and the `keystone-engine` package installed.
+This patcher requires Python and the `keystone-engine` / `capstone` packages installed.
 
 Using Poetry:
 
@@ -45,7 +45,7 @@ pip install -r requirements.txt
 - Mi4Pro2nd
 - Mi4Lite
 - Mi5
-- Mi5 Plus (region patch)
+- Mi5 Plus (verified speed hook; region patch intentionally disabled)
 - Mi5Pro
 - Mi5Max
 - Mi5Elite
@@ -57,16 +57,58 @@ This tool can modify various firmware parameters. The specific parameters availa
 
 Common patch codes:
 
-- `rfm`: region free
-- `sls=<kmh>`: speed limit sport
-- `sld=<kmh>`: speed limit drive
-- `rsls`: remove speed limit sport
+- `sls=<kmh>`: speed limit sport API; on Mi5 Plus this currently targets the verified common active-profile speed hook
+- `sld=<kmh>`: speed limit drive API; on Mi5 Plus this currently targets the verified common active-profile speed hook
+- `slp=<kmh>`: pedestrian speed API
+- `rsls`: remove sport speed limit API
 - `mss=<kmh>`: motor start speed
 - `cce`: cruise control enable
-- `fdv=<version>`: fake firmware version
-- `chk`: fix checksum
+- `rfm`: region free where a model-specific verified patch exists
+- `fdv=<version>`: fake firmware version where implemented
+- `chk`: fix checksum where supported by the model
 
-`region_free` is also accepted as a compatibility alias for `rfm`.
+For Mi5 Plus specifically, `rfm/region_free` is intentionally refused until a region table is verified against the original BIN. No blind writes are performed at `0x3440` or `0x3C80`.
+
+## Xiaomi 5 Plus Reverse Engineering
+
+The current Mi5 Plus work is based on the original image used during RE:
+
+- Size: `125371` bytes
+- SHA-256: `bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4`
+- Flash base: `0x08000000`
+- Confirmed speed hook: file `0x5C74`, MCU `0x08005C74`
+- Hook bytes: `AB 49 78 7A 08 80`
+- Patch instruction: file `0x5C76`, `78 7A` → `XX 20` (`MOVS r0,#XX`)
+- Runtime destination: `0x20000234`
+
+The repository deliberately distinguishes bytecode facts from semantic guesses. In particular, the previously claimed `0x20001E2C = 0/1/2` mode mapping, `0x0800A412` writer, `0x08005834` default-mode write, and region tables at `0x3440/0x3C80` are not treated as verified.
+
+## Reverse-Engineering Tools
+
+The repository now includes a CFG-aware Thumb/Thumb-2 analysis layer:
+
+```bash
+python tools/analyze_mi5plus.py path/to/mcu_xiaomi.scooter.5plus.bin
+```
+
+Inspect a particular RAM/Flash target:
+
+```bash
+python tools/analyze_mi5plus.py firmware.bin --target 0x20001E2C --json report.json
+```
+
+The analyzer:
+
+- validates the raw image and computes SHA-256;
+- reads the Cortex-M vector table;
+- follows reachable Thumb/Thumb-2 control flow to reduce literal-pool false positives;
+- resolves PC-relative literal references;
+- searches bounded data-flow for memory readers/writers;
+- reports candidate mode comparisons for `0/1/2` without automatically naming them Eco/Drive/Sport;
+- detects the confirmed 5 Plus speed hook;
+- never modifies the input firmware.
+
+The authoritative methodology and current evidence table are in [docs/MI5PLUS_RE.md](docs/MI5PLUS_RE.md).
 
 ## Usage
 
@@ -96,16 +138,10 @@ The GUI provides an interactive interface for selecting firmware modifications. 
 
 ## Example Usage
 
-Apply the Mi 5 Plus region patch and fix checksum:
+For Mi5 Plus speed testing:
 
 ```bash
-poetry run python -m bwpatcher mi5plus firmware.bin firmware_modified.bin rfm,chk
-```
-
-The older alias is also accepted:
-
-```bash
-poetry run python -m bwpatcher mi5plus firmware.bin firmware_modified.bin region_free,chk
+poetry run python -m bwpatcher mi5plus firmware.bin firmware_modified.bin sld=35
 ```
 
 Always maintain raw backups of your original firmware before performing any modifications or manual hardware flashing.

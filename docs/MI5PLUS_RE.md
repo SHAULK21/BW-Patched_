@@ -1,7 +1,7 @@
 # Xiaomi Scooter 5 Plus — RE status
 
 This document is the evidence baseline for `mi5plus` reverse engineering.
-It is based on the raw firmware image used in the current investigation:
+It is based on the raw firmware image used during the investigation:
 
 - file size: `125371` bytes
 - SHA-256: `bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4`
@@ -13,7 +13,7 @@ It is based on the raw firmware image used in the current investigation:
 `CONFIRMED` means the claim is directly supported by bytes/disassembly from the
 actual BIN. `STRONG CANDIDATE` means there is useful local evidence but the
 semantics are not completely proven. `UNVERIFIED` means it must not be used as
-a patch target.
+a patch target. `REFUTED` means direct byte-level evidence contradicts the claim.
 
 ## Confirmed speed hook
 
@@ -43,66 +43,80 @@ This is the only speed byte hook currently treated as `CONFIRMED`.
 ## Confirmed controller block
 
 The function beginning at file offset `0x3698` / MCU `0x08003698` is real
-controller code, but an earlier AI-generated reconstruction contained incorrect
-instruction bytes. The following facts are supported by the actual image:
+controller code. The current evidence supports:
 
 - runtime speed input is read from `0x20000234`;
-- at `0x3740..0x3744`, byte `0x200002E5` is compared with `1`;
-- the normal path multiplies a working value by `0xAE` (`174`), divides by `10`
-  through the existing helper, and stores the result at control-object `+0x18`;
-- the control object resolves to RAM `0x20001E40`;
-- at `0x376A..0x376E`, the special path constructs `0x1B3` (`435`);
+- a byte at `0x200002E5` is checked against `1` around `0x3740..0x3744`;
+- the configured path performs multiplication by `0xAE` (`174`) and division by
+  `10` through the existing helper;
+- the resulting value is stored in control-object `+0x18`;
+- the control object resolves to RAM `0x20001E40` in the investigated image;
+- the later path constructs `0x1B3` (`435`) around `0x376A..0x376E`;
 - at `0x378C..0x3796`, `control+0x14` is compared with `control+0x18` and
   clamped downward when the target is higher than the limit.
 
-The semantic meaning of every intermediate field must still be stated with
-appropriate confidence; do not copy the obsolete `SDIV at 0x36A2` description.
+### `0x200002E5` semantic status
+
+The address is **CONFIRMED as a byte read/check in the controller function**.
+Its higher-level meaning is **UNVERIFIED**.
+
+An earlier interpretation — `0x200002E5 == 1` means "force 435" — is rejected.
+The patcher does not encode that semantic and does not patch this byte.
+
+## Mi 5 Plus container CRC-16
+
+The 5 Plus image contains a verified container integrity field:
+
+- marker: `SZMC-ES-02664-LQ` at file `0x90`;
+- size field: `0x8C00` at file `0x86`, big-endian;
+- stored CRC: `0xEC8C` at file `0xB0`, big-endian;
+- protected data range: `[0x100:0x8D00)`;
+- CRC: CRC-16-CCITT, polynomial `0x1021`, init `0x0000`, non-reflected,
+  xorout `0x0000`.
+
+For the pristine reference image the computed CRC equals the stored `0xEC8C`.
+Because the speed hook lies inside the protected range, `mi5plus` recalculates
+this CRC after changing speed and writes the new big-endian value to `0xB0`.
+
+The generic ES32 checksum routine is intentionally not used for 5 Plus because
+it expects a different container marker/layout.
 
 ## Confirmed / refuted mode claims
 
-`0x20001E22` is a real RAM address referenced by the function at `0x0800345C`.
-The field `+0x0A` therefore maps to `0x20001E2C` and is written in that function.
+`0x20001E22` is a real RAM address referenced by code and field `+0x0A` maps to
+`0x20001E2C`. The field is written, but its value is derived from other runtime
+state.
 
-However, the actual writes are not literal `1` and `2`; the value depends on
-other runtime state. Therefore:
+Current status:
 
-- `0x20001E2C` as a real state field: **CONFIRMED**
+- `0x20001E22` / field `+0x0A` as a real RAM state field: **CONFIRMED**
 - `0x20001E2C = 0/1/2 Eco/Drive/Sport`: **UNVERIFIED**
 - `0x0800A412` as its writer: **REFUTED**
 - `0x08005834` as a default `1` mode write: **REFUTED**
 
-`0x200002B7` is used as a runtime index/state in the protocol/configuration
-logic and is not a proven three-mode selector.
+`0x200002B7` is used as a runtime index/state in protocol/configuration logic and
+is not a proven three-mode selector.
 
 ## Refuted region claim
 
 File offsets `0x3440` and `0x3C80` were previously described as seven-entry
 regional speed tables. Direct byte inspection shows pointer/literal-pool-like
 contents (`0x2000xxxx` values and code/data), so they must **not** be overwritten.
-The production `mi5plus` module therefore refuses the old blind region patch.
+The production `mi5plus` module refuses the old blind region patch.
 
-## What the integrated RE analyzer does
+## Production patcher behavior
 
-`bwpatcher/re/thumb_re.py` provides:
+The `mi5plus` module:
 
-- raw-image SHA-256 and vector-table validation;
-- ARM Thumb/Thumb-2 decoding through the existing Capstone dependency;
-- CFG-style recovery starting from Cortex-M vector entries;
-- PC-relative literal resolution;
-- bounded register-constant data-flow;
-- memory reader/writer searches for RAM/Flash targets;
-- mode-like `CMP #0/#1/#2` candidate detection;
-- exact speed-hook identification;
-- JSON-friendly reports.
+1. identifies the speed hook from its instruction shape and requires a unique
+   match;
+2. replaces only the 2-byte `LDRB` instruction with Thumb `MOVS r0,#imm8`;
+3. recalculates the verified 5 Plus CRC-16 after the patch;
+4. leaves mode selection and region changes untouched until their semantics are
+   independently proven.
 
-The analyzer is intentionally analysis-only and never writes firmware bytes.
-
-CLI:
-
-```bash
-python tools/analyze_mi5plus.py path/to/mcu_xiaomi.scooter.5plus.bin
-python tools/analyze_mi5plus.py path/to/firmware.bin --target 0x20001E2C --json report.json
-```
+All public speed controls currently reach the same verified active speed hook.
+This does not claim that three independent Flash speed bytes have been found.
 
 ## How to continue Eco/Drive/Sport RE
 
@@ -113,17 +127,16 @@ Start from the verified speed hook and trace the base register backwards:
         |
         +--> determine how r7 is formed
               |
-              +--> identify the structure at r7
+              +--> determine whether r7 is a profile pointer or a fixed RAM base
                     |
-                    +--> identify writers of its +0x09 field
+                    +--> identify writers/readers of the +0x09 source
                           |
-                          +--> connect the structure to mode/state logic
+                          +--> connect the value to mode/state input
 ```
 
-In parallel, inspect the real state field around `0x20001E22` and especially
-writers/readers of `0x2000025C` / `0x2000034E`. A mode label is only warranted
-when a concrete value can be followed from a mode-selection input to a distinct
-control path.
+Also inspect the real state field around `0x20001E22`, but do not assign
+Eco/Drive/Sport semantics until a concrete value can be followed from an input
+packet or state transition into a distinct control path.
 
 ## How to continue current/power RE
 
@@ -141,4 +154,4 @@ they look plausible. Connect source → scaling → comparison/clamp → actuato
 
 The Python patcher should only patch a signature that is verified against the
 actual BIN. For production patching, the exact original bytes and expected
-firmware fingerprint must be checked before writing.
+firmware fingerprint should be checked before writing.

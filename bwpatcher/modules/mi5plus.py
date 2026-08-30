@@ -5,18 +5,14 @@
 The speed patcher is based on the original 5 Plus BIN used during reverse
 engineering (125371 bytes, SHA-256 bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4).
 
-The verified hook in that image is:
+Confirmed reference hook in that image:
     file 0x5C74: AB 49 78 7A 08 80
     file 0x5C76: 78 7A = LDRB r0,[r7,#9]
     file 0x5C78: 08 80 = STRH r0,[r1]
 
-Firmware revisions may change the PC-relative literal offset, so the patcher
-uses the full verified instruction shape (?? 49 78 7A 08 80) rather than
-requiring the literal-load byte AB. It still requires a UNIQUE match and
-never patches a generic XX 20 sequence.
-
-Mode semantics remain RE-only. No unverified Eco/Drive/Sport addresses are
-written by this module.
+The module uses the verified 5 Plus container CRC format and keeps mode
+semantics evidence-only until a concrete value can be traced from input to
+control path.
 """
 
 from __future__ import annotations
@@ -32,32 +28,40 @@ FLASH_BASE_ADDR = 0x08000000
 FIRMWARE_SIZE = 125371
 FIRMWARE_SHA256 = "bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4"
 
-# Confirmed hook from the original research BIN.
+# ---------------------------------------------------------------------------
+# Confirmed speed hook
+# ---------------------------------------------------------------------------
 SPEED_HOOK_MCU = 0x08005C76
 SPEED_HOOK_OFFSET = SPEED_HOOK_MCU - FLASH_BASE_ADDR  # 0x5C76
 SPEED_HOOK_PREFIX = b"\xAB\x49"
-SPEED_HOOK_GENERIC_PREFIX = b"\x00\x49"
 SPEED_HOOK_SUFFIX = b"\x08\x80"
-SPEED_HOOK_ORIGINAL = b"\x78\x7A"
+SPEED_HOOK_ORIGINAL = b"\x78\x7A"  # LDRB r0,[r7,#9]
 SPEED_RUNTIME_ADDR = 0x20000234
 SPEED_PROFILE_FIELD = 0x09
 
-# RE metadata only; do not use these as blind Flash write locations.
+# ---------------------------------------------------------------------------
+# Confirmed controller metadata from the reference BIN
+# ---------------------------------------------------------------------------
 SPEED_CONTROL_START_MCU = 0x08003698
 SPEED_CONTROL_END_MCU = 0x08003964
 SPEED_CONTROL_OBJECT = 0x20001E40
 SPEED_TARGET_FIELD = 0x14
 SPEED_LIMIT_FIELD = 0x18
-SPEED_GATE_ADDR = 0x200002E5
-SPEED_GATE_TRIGGER = 1
-SPEED_GATE_LIMIT = 435
+
+# 0x200002E5 is a real runtime byte checked by the controller, but its
+# application semantics are intentionally NOT hard-coded here. The prior
+# claim "value == 1 forces 435" is not used by the patcher.
+SPEED_STATE_BYTE_ADDR = 0x200002E5
+SPEED_STATE_BYTE_STATUS = "SEMANTICS_UNVERIFIED"
 SPEED_SCALE_NUMERATOR = 0xAE
 SPEED_SCALE_DIVISOR = 10
 
-# Mode candidate kept as evidence metadata only.
+# ---------------------------------------------------------------------------
+# Mode research metadata only
+# ---------------------------------------------------------------------------
 MODE_STRUCTURE_ADDR = 0x20001E22
 MODE_FIELD_OFFSET = 0x0A
-MODE_FIELD_ADDR = MODE_STRUCTURE_ADDR + MODE_FIELD_OFFSET
+MODE_FIELD_ADDR = MODE_STRUCTURE_ADDR + MODE_FIELD_OFFSET  # 0x20001E2C
 MODE_MAPPING_STATUS = "UNVERIFIED"
 
 REJECTED_RE_CLAIMS = {
@@ -65,11 +69,23 @@ REJECTED_RE_CLAIMS = {
     "claimed_mode_init": 0x08005834,
     "claimed_region_table_1": 0x3440,
     "claimed_region_table_2": 0x3C80,
+    "claimed_0x200002E5_semantics": "value==1 -> 435 (rejected)",
 }
+
+# ---------------------------------------------------------------------------
+# 5 Plus container CRC-16
+# ---------------------------------------------------------------------------
+CONTAINER_MARKER = b"SZMC-ES-02664-LQ"
+CRC_SIZE_FIELD_OFFSET = -0x0A  # marker + (-0x0A) = file 0x86
+CRC_VALUE_OFFSET_FROM_MARKER = 0x20  # file 0xB0
+CRC_DATA_OFFSET_FROM_MARKER = 0x70  # file 0x100
+CRC_POLY = 0x1021
+CRC_INIT = 0x0000
+CRC_XOROUT = 0x0000
 
 
 class Mi5plusPatcher(ES32Patcher):
-    """Xiaomi 5 Plus patcher with an evidence-first speed hook."""
+    """Xiaomi 5 Plus patcher with verified speed hook and CRC-16 support."""
 
     NAME = "Xiaomi Electric Scooter 5 Plus"
 
@@ -81,57 +97,38 @@ class Mi5plusPatcher(ES32Patcher):
         self.current_speed: Optional[int] = None
 
     # ------------------------------------------------------------------
-    # Firmware / hook discovery
+    # Firmware identity / speed hook
     # ------------------------------------------------------------------
     def firmware_fingerprint(self) -> dict:
+        sha = hashlib.sha256(bytes(self.data)).hexdigest()
         return {
             "size": len(self.data),
-            "sha256": hashlib.sha256(bytes(self.data)).hexdigest(),
-            "known_original": len(self.data) == FIRMWARE_SIZE
-            and hashlib.sha256(bytes(self.data)).hexdigest() == FIRMWARE_SHA256,
+            "sha256": sha,
+            "known_reference_image": len(self.data) == FIRMWARE_SIZE and sha == FIRMWARE_SHA256,
         }
 
     @staticmethod
     def _is_movs_r0_imm(opcode: bytes) -> bool:
-        return len(opcode) == 2 and opcode[1] == 0x20 and 0x00 <= opcode[0] <= 0xFF
+        return len(opcode) == 2 and opcode[1] == 0x20
 
-    def _scan_speed_hook_candidates(self) -> list[tuple[int, str, bool]]:
-        """Find the verified hook by instruction shape, not just one literal.
-
-        Accepted pristine form:
-            ?? 49 78 7A 08 80
-        Accepted patched form:
-            ?? 49 XX 20 08 80
-
-        The surrounding bytes encode a PC-relative LDR r1 followed by the
-        LDRB/STRH pair used by the verified speed hook. The match must be
-        unique in the complete image.
-        """
+    def _scan_speed_hook_candidates(self):
         data = bytes(self.data)
-        candidates: list[tuple[int, str, bool]] = []
-
-        for pos in range(max(0, len(data) - 6 + 1)):
+        candidates = []
+        for pos in range(0, max(0, len(data) - 5)):
             if data[pos + 1] != 0x49 or data[pos + 4:pos + 6] != SPEED_HOOK_SUFFIX:
                 continue
-
             middle = data[pos + 2:pos + 4]
             if middle == SPEED_HOOK_ORIGINAL:
                 candidates.append((pos, "pristine", False))
             elif self._is_movs_r0_imm(middle):
                 candidates.append((pos, "patched", True))
-
         return candidates
 
-    def _find_speed_hook(self) -> tuple[int, str, bool]:
-        """Return (hook_start, form, already_patched) for a unique hook."""
+    def _find_speed_hook(self):
         candidates = self._scan_speed_hook_candidates()
-
-        # Prefer the exact original research point when it is present. This
-        # also gives a clear result for the supplied 125371-byte reference BIN.
-        at_known = [c for c in candidates if c[0] == SPEED_HOOK_OFFSET - 2]
-        if len(at_known) == 1:
-            return at_known[0]
-
+        known = [c for c in candidates if c[0] == SPEED_HOOK_OFFSET - 2]
+        if len(known) == 1:
+            return known[0]
         if len(candidates) == 1:
             return candidates[0]
 
@@ -141,7 +138,7 @@ class Mi5plusPatcher(ES32Patcher):
             "Mi 5 Plus: speed hook not uniquely detected. "
             f"file_size={len(data)}, expected_at_0x5C74={expected.hex(' ')}, "
             f"candidate_count={len(candidates)}. "
-            "Accepted shape: ?? 49 78 7A 08 80 or ?? 49 XX 20 08 80."
+            "Expected shape: ?? 49 78 7A 08 80 or ?? 49 XX 20 08 80."
         )
 
     def verify_firmware(self):
@@ -156,18 +153,92 @@ class Mi5plusPatcher(ES32Patcher):
         self.hook_start = start
         self.hook_offset = start + 2
         self.hook_form = form
-        if patched:
-            self.current_speed = self.data[self.hook_offset]
+        self.current_speed = self.data[self.hook_offset] if patched else None
         return self.hook_offset
+
+    # ------------------------------------------------------------------
+    # 5 Plus CRC-16 container integrity
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _crc16_ccitt(data: bytes) -> int:
+        crc = CRC_INIT
+        for byte in data:
+            crc ^= byte << 8
+            for _ in range(8):
+                if crc & 0x8000:
+                    crc = ((crc << 1) ^ CRC_POLY) & 0xFFFF
+                else:
+                    crc = (crc << 1) & 0xFFFF
+        return crc ^ CRC_XOROUT
+
+    def _container_layout(self):
+        marker = bytes(self.data).find(CONTAINER_MARKER)
+        if marker < 0:
+            raise SignatureException(
+                "Mi 5 Plus: container marker SZMC-ES-02664-LQ not found"
+            )
+
+        size_pos = marker + CRC_SIZE_FIELD_OFFSET
+        if size_pos < 0 or size_pos + 2 > len(self.data):
+            raise SignatureException("Mi 5 Plus: invalid CRC size field location")
+
+        region_size = int.from_bytes(self.data[size_pos:size_pos + 2], "big")
+        data_start = marker + CRC_DATA_OFFSET_FROM_MARKER
+        data_end = data_start + region_size
+        crc_pos = marker + CRC_VALUE_OFFSET_FROM_MARKER
+
+        if data_end > len(self.data):
+            raise SignatureException(
+                f"Mi 5 Plus: CRC protected range exceeds firmware: 0x{data_start:X}:0x{data_end:X}"
+            )
+        if crc_pos < 0 or crc_pos + 2 > len(self.data):
+            raise SignatureException("Mi 5 Plus: invalid CRC storage offset")
+
+        return marker, region_size, data_start, data_end, crc_pos
+
+    def fix_checksum(self):
+        """Recalculate the verified 5 Plus container CRC-16.
+
+        Reference image:
+            marker  = 0x90
+            size    = 0x8C00 at 0x86 (big-endian)
+            data    = [0x100:0x8D00]
+            CRC     = 0xEC8C at 0xB0 (big-endian)
+
+        The CRC field is outside the protected data range, so the calculation
+        is performed directly over the protected bytes.
+        """
+        marker, region_size, data_start, data_end, crc_pos = self._container_layout()
+        protected = bytes(self.data[data_start:data_end])
+        old = bytes(self.data[crc_pos:crc_pos + 2])
+        new_crc = self._crc16_ccitt(protected)
+        post = new_crc.to_bytes(2, "big")
+        self.data[crc_pos:crc_pos + 2] = post
+
+        return [("fix_checksum_5plus", hex(crc_pos), old.hex(), post.hex())]
+
+    def verify_checksum(self):
+        marker, region_size, data_start, data_end, crc_pos = self._container_layout()
+        stored = int.from_bytes(self.data[crc_pos:crc_pos + 2], "big")
+        computed = self._crc16_ccitt(bytes(self.data[data_start:data_end]))
+        return {
+            "marker_offset": marker,
+            "region_size": region_size,
+            "data_start": data_start,
+            "data_end": data_end,
+            "crc_offset": crc_pos,
+            "stored": stored,
+            "computed": computed,
+            "valid": stored == computed,
+        }
 
     # ------------------------------------------------------------------
     # Diagnostics / RE map
     # ------------------------------------------------------------------
     def reverse_engineering_map(self):
+        fp = self.firmware_fingerprint()
         return {
-            "firmware_size": len(self.data),
-            "firmware_sha256": hashlib.sha256(bytes(self.data)).hexdigest(),
-            "known_original_sha256": FIRMWARE_SHA256,
+            **fp,
             "speed_hook_file": SPEED_HOOK_OFFSET,
             "speed_hook_mcu": SPEED_HOOK_MCU,
             "speed_runtime_addr": SPEED_RUNTIME_ADDR,
@@ -177,9 +248,8 @@ class Mi5plusPatcher(ES32Patcher):
             "speed_control_object": SPEED_CONTROL_OBJECT,
             "speed_target_field": SPEED_TARGET_FIELD,
             "speed_limit_field": SPEED_LIMIT_FIELD,
-            "speed_gate_addr": SPEED_GATE_ADDR,
-            "speed_gate_trigger": SPEED_GATE_TRIGGER,
-            "speed_gate_limit": SPEED_GATE_LIMIT,
+            "speed_state_byte_addr": SPEED_STATE_BYTE_ADDR,
+            "speed_state_byte_status": SPEED_STATE_BYTE_STATUS,
             "speed_scale": f"{SPEED_SCALE_NUMERATOR}/{SPEED_SCALE_DIVISOR}",
             "mode_structure_addr": MODE_STRUCTURE_ADDR,
             "mode_field_addr": MODE_FIELD_ADDR,
@@ -190,22 +260,27 @@ class Mi5plusPatcher(ES32Patcher):
     def diagnose(self):
         print("=" * 72)
         print("XIAOMI 5 PLUS / BRIGHTWAY ES32")
-        print("Evidence-first speed diagnostic")
+        print("Evidence-first speed / CRC diagnostic")
         print("=" * 72)
         fp = self.firmware_fingerprint()
-        print(f"Size: {fp['size']} (known reference: {FIRMWARE_SIZE})")
+        print(f"Size: {fp['size']} (reference {FIRMWARE_SIZE})")
         print(f"SHA-256: {fp['sha256']}")
-        print(f"Known reference image: {fp['known_original']}")
+        print(f"Reference image: {fp['known_reference_image']}")
         try:
             ofs = self.find_speed_hook()
+            print(f"[+] Speed hook: file 0x{ofs:05X}, MCU 0x{FLASH_BASE_ADDR + ofs:08X}")
+            print(f"    Form: {self.hook_form}")
         except SignatureException as exc:
             print(f"[-] {exc}")
-            return -1
-        print(f"[+] Speed hook: file 0x{ofs:05X}, MCU 0x{FLASH_BASE_ADDR + ofs:08X}")
-        print(f"    Form: {self.hook_form}")
-        if self.current_speed is not None:
-            print(f"    Current patched parameter: {self.current_speed} (0x{self.current_speed:02X})")
-        return ofs
+        try:
+            crc = self.verify_checksum()
+            print(
+                f"[CRC] stored=0x{crc['stored']:04X} computed=0x{crc['computed']:04X} "
+                f"valid={crc['valid']} range=[0x{crc['data_start']:X}:0x{crc['data_end']:X}]"
+            )
+        except SignatureException as exc:
+            print(f"[CRC] [-] {exc}")
+        return self.hook_offset if self.hook_offset is not None else -1
 
     # ------------------------------------------------------------------
     # Speed patch
@@ -219,20 +294,14 @@ class Mi5plusPatcher(ES32Patcher):
 
     def _patch_speed(self, kmh):
         self.find_speed_hook()
-        if self.hook_offset is None:
-            raise SignatureException("Mi 5 Plus: speed hook offset is unavailable")
-
         pre = bytes(self.data[self.hook_offset:self.hook_offset + 2])
         post = self._speed_opcode(kmh)
-
         if pre != SPEED_HOOK_ORIGINAL and not self._is_movs_r0_imm(pre):
             raise SignatureException(
                 f"Mi 5 Plus: unexpected opcode at 0x{self.hook_offset:X}: {pre.hex(' ')}"
             )
-
         if pre != post:
             self.data[self.hook_offset:self.hook_offset + 2] = post
-
         self.current_speed = post[0]
         self.hook_form = "patched"
         return [
@@ -243,8 +312,6 @@ class Mi5plusPatcher(ES32Patcher):
     def speed_limit_active_profile(self, kmh):
         return self._patch_speed(kmh)
 
-    # All public speed controls intentionally address the same active-profile
-    # hook. We have NOT proven three independent Flash speed bytes.
     def speed_limit_ped(self, kmh):
         return self._patch_speed(kmh)
 
@@ -258,9 +325,6 @@ class Mi5plusPatcher(ES32Patcher):
         return self._patch_speed(speed)
 
     def remove_speed_limit_sport(self):
-        # Keep compatibility with the BW patch-map. This means setting the
-        # active hook to the maximum encodable byte; it does not remove every
-        # other controller safety limit.
         return self._patch_speed(0xFF)
 
     # ------------------------------------------------------------------
@@ -289,4 +353,5 @@ def patch_mi5plus(firmware_data, speed_kmh=35):
     patcher = Mi5plusPatcher(firmware_data)
     patcher.diagnose()
     patcher.speed_limit_active_profile(speed_kmh)
+    patcher.fix_checksum()
     return patcher.data

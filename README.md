@@ -74,15 +74,15 @@ For Mi5 Plus specifically, `rfm/region_free` is intentionally refused until a re
 
 ## Mi5 Plus OTA → MCU image conversion
 
-The reference Mi5 Plus OTA package is 125371 bytes and contains a binary trailer marker `MI EF TFOTA` at file offset `0x1E480`, followed by the model identifier and X.509 certificate material. The converter validates this trailer, verifies the existing CRC-16, then keeps the exact prefix before the trailer as the embedded image.
+The reference Mi5 Plus OTA package contains a binary trailer marker `MI EF TFOTA` at file offset `0x1E484`, followed by the model identifier and X.509 certificate material. The converter validates this trailer, verifies the existing CRC-16, then keeps the exact prefix before the trailer as the embedded image.
 
 For the reference package:
 
 ```text
 OTA package size:      125371 (0x1E9BB)
-Embedded image end:    0x1E480
-Embedded image size:   124032 bytes (0x1E480)
-OTA trailer size:      1339 bytes (0x53B)
+Embedded image end:    0x1E484
+Embedded image size:   124036 bytes (0x1E484)
+OTA trailer size:      1335 bytes (0x537)
 ```
 
 The image is not padded to 64 KiB and no vector table is fabricated. The original firmware-relative addresses, including the confirmed speed hook at `0x5C76`, stay unchanged.

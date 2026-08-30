@@ -20,8 +20,10 @@ Read the full [PRINCIPLES.md](PRINCIPLES.md) and [LEGAL_DISCLAIMER.md](LEGAL_DIS
 
 This tool does not flash the scooter directly. The flashing process requires a two-step workflow:
 
-1. Patching: run this tool locally on your PC. It takes your original downloaded firmware dump, modifies selected parameters, recalculates required CRC checksums, and saves a new `.bin` file.
-2. Flashing: manually flash the generated output file using a suitable hardware flashing tool and procedure for your controller.
+1. Patching: run this tool locally on your PC. It takes your original firmware package, modifies selected parameters, recalculates required CRC checksums, and can extract the embedded MCU image.
+2. Flashing: manually flash the generated image using a suitable hardware flashing tool and a procedure verified for your controller.
+
+For Mi5 Plus, the OTA package contains a signed trailer. The `img` operation strips that validated trailer and preserves the complete firmware prefix; it does **not** synthesize a new 64 KiB image.
 
 ## Setup
 
@@ -66,12 +68,50 @@ Common patch codes:
 - `rfm`: region free where a model-specific verified patch exists
 - `fdv=<version>`: fake firmware version where implemented
 - `chk`: fix checksum where supported by the model
+- `img`: Mi5 Plus only — extract the embedded MCU image from the signed OTA container
 
 For Mi5 Plus specifically, `rfm/region_free` is intentionally refused until a region table is verified against the original BIN. No blind writes are performed at `0x3440` or `0x3C80`.
 
+## Mi5 Plus OTA → MCU image conversion
+
+The reference Mi5 Plus OTA package is 125371 bytes and contains a binary trailer marker `MI EF TFOTA` at file offset `0x1E480`, followed by the model identifier and X.509 certificate material. The converter validates this trailer, verifies the existing CRC-16, then keeps the exact prefix before the trailer as the embedded image.
+
+For the reference package:
+
+```text
+OTA package size:      125371 (0x1E9BB)
+Embedded image end:    0x1E480
+Embedded image size:   124032 bytes (0x1E480)
+OTA trailer size:      1339 bytes (0x53B)
+```
+
+The image is not padded to 64 KiB and no vector table is fabricated. The original firmware-relative addresses, including the confirmed speed hook at `0x5C76`, stay unchanged.
+
+### CLI examples
+
+Patch speed and output the OTA container:
+
+```bash
+poetry run python -m bwpatcher mi5plus firmware.bin firmware_patched_35.bin sld=35
+```
+
+Patch speed and then extract the embedded MCU image:
+
+```bash
+poetry run python -m bwpatcher mi5plus firmware.bin mi5plus_flash_image_35.bin sld=35,img
+```
+
+Extract the MCU image without changing firmware bytes:
+
+```bash
+poetry run python -m bwpatcher mi5plus firmware.bin mi5plus_flash_image.bin img
+```
+
+The `img` operation refuses conversion when the OTA trailer or container CRC cannot be validated. An already-extracted image is accepted only when the confirmed Mi5 Plus speed hook can still be located.
+
 ## Xiaomi 5 Plus Reverse Engineering
 
-The current Mi5 Plus work is based on the original image used during RE:
+The current Mi5Plus work is based on the original OTA package used during RE:
 
 - Size: `125371` bytes
 - SHA-256: `bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4`
@@ -80,12 +120,13 @@ The current Mi5 Plus work is based on the original image used during RE:
 - Hook bytes: `AB 49 78 7A 08 80`
 - Patch instruction: file `0x5C76`, `78 7A` → `XX 20` (`MOVS r0,#XX`)
 - Runtime destination: `0x20000234`
+- 5 Plus CRC: CRC-16-CCITT over `[0x100:0x8D00)`, stored big-endian at `0xB0`
 
-The repository deliberately distinguishes bytecode facts from semantic guesses. In particular, the previously claimed `0x20001E2C = 0/1/2` mode mapping, `0x0800A412` writer, `0x08005834` default-mode write, and region tables at `0x3440/0x3C80` are not treated as verified.
+The repository deliberately distinguishes bytecode facts from semantic guesses. In particular, the previously claimed `0x20001E2C = 0/1/2` mode mapping, `0x0800A412` writer, `0x08005834` default-mode write, `0x3440/0x3C80` region tables, and the high-level meaning `0x200002E5 == 1 → 435` are not treated as verified patch semantics.
 
 ## Reverse-Engineering Tools
 
-The repository now includes a CFG-aware Thumb/Thumb-2 analysis layer:
+The repository includes a CFG-aware Thumb/Thumb-2 analysis layer:
 
 ```bash
 python tools/analyze_mi5plus.py path/to/mcu_xiaomi.scooter.5plus.bin
@@ -99,12 +140,12 @@ python tools/analyze_mi5plus.py firmware.bin --target 0x20001E2C --json report.j
 
 The analyzer:
 
-- validates the raw image and computes SHA-256;
-- reads the Cortex-M vector table;
+- validates the raw input and computes SHA-256;
+- reads the Cortex-M vector-style data where applicable;
 - follows reachable Thumb/Thumb-2 control flow to reduce literal-pool false positives;
 - resolves PC-relative literal references;
 - searches bounded data-flow for memory readers/writers;
-- reports candidate mode comparisons for `0/1/2` without automatically naming them Eco/Drive/Sport;
+- reports mode-like comparisons for `0/1/2` without automatically naming them Eco/Drive/Sport;
 - detects the confirmed 5 Plus speed hook;
 - never modifies the input firmware.
 
@@ -138,10 +179,10 @@ The GUI provides an interactive interface for selecting firmware modifications. 
 
 ## Example Usage
 
-For Mi5 Plus speed testing:
+For Mi5 Plus speed testing with image extraction:
 
 ```bash
-poetry run python -m bwpatcher mi5plus firmware.bin firmware_modified.bin sld=35
+poetry run python -m bwpatcher mi5plus firmware.bin mi5plus_flash_image_35.bin sld=35,img
 ```
 
 Always maintain raw backups of your original firmware before performing any modifications or manual hardware flashing.

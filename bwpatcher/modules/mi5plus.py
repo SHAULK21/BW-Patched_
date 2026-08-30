@@ -28,40 +28,33 @@ FLASH_BASE_ADDR = 0x08000000
 FIRMWARE_SIZE = 125371
 FIRMWARE_SHA256 = "bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4"
 
-# ---------------------------------------------------------------------------
-# Confirmed speed hook
-# ---------------------------------------------------------------------------
+# Confirmed speed hook.
 SPEED_HOOK_MCU = 0x08005C76
-SPEED_HOOK_OFFSET = SPEED_HOOK_MCU - FLASH_BASE_ADDR  # 0x5C76
+SPEED_HOOK_OFFSET = SPEED_HOOK_MCU - FLASH_BASE_ADDR
 SPEED_HOOK_PREFIX = b"\xAB\x49"
 SPEED_HOOK_SUFFIX = b"\x08\x80"
 SPEED_HOOK_ORIGINAL = b"\x78\x7A"  # LDRB r0,[r7,#9]
 SPEED_RUNTIME_ADDR = 0x20000234
 SPEED_PROFILE_FIELD = 0x09
 
-# ---------------------------------------------------------------------------
-# Confirmed controller metadata from the reference BIN
-# ---------------------------------------------------------------------------
+# Confirmed controller metadata from the reference BIN.
 SPEED_CONTROL_START_MCU = 0x08003698
 SPEED_CONTROL_END_MCU = 0x08003964
 SPEED_CONTROL_OBJECT = 0x20001E40
 SPEED_TARGET_FIELD = 0x14
 SPEED_LIMIT_FIELD = 0x18
 
-# 0x200002E5 is a real runtime byte checked by the controller, but its
-# application semantics are intentionally NOT hard-coded here. The prior
-# claim "value == 1 forces 435" is not used by the patcher.
+# Runtime byte is confirmed as a controller input/check, but its application
+# semantics are not proven. In particular, do NOT encode "==1 -> 435" here.
 SPEED_STATE_BYTE_ADDR = 0x200002E5
 SPEED_STATE_BYTE_STATUS = "SEMANTICS_UNVERIFIED"
 SPEED_SCALE_NUMERATOR = 0xAE
 SPEED_SCALE_DIVISOR = 10
 
-# ---------------------------------------------------------------------------
-# Mode research metadata only
-# ---------------------------------------------------------------------------
+# Mode research only. No mode semantics are used for patching.
 MODE_STRUCTURE_ADDR = 0x20001E22
 MODE_FIELD_OFFSET = 0x0A
-MODE_FIELD_ADDR = MODE_STRUCTURE_ADDR + MODE_FIELD_OFFSET  # 0x20001E2C
+MODE_FIELD_ADDR = MODE_STRUCTURE_ADDR + MODE_FIELD_OFFSET
 MODE_MAPPING_STATUS = "UNVERIFIED"
 
 REJECTED_RE_CLAIMS = {
@@ -72,20 +65,18 @@ REJECTED_RE_CLAIMS = {
     "claimed_0x200002E5_semantics": "value==1 -> 435 (rejected)",
 }
 
-# ---------------------------------------------------------------------------
-# 5 Plus container CRC-16
-# ---------------------------------------------------------------------------
+# Verified 5 Plus container CRC-16.
 CONTAINER_MARKER = b"SZMC-ES-02664-LQ"
-CRC_SIZE_FIELD_OFFSET = -0x0A  # marker + (-0x0A) = file 0x86
-CRC_VALUE_OFFSET_FROM_MARKER = 0x20  # file 0xB0
-CRC_DATA_OFFSET_FROM_MARKER = 0x70  # file 0x100
+CRC_SIZE_FIELD_OFFSET = -0x0A       # marker - 0x0A = file 0x86
+CRC_VALUE_OFFSET_FROM_MARKER = 0x20 # marker + 0x20 = file 0xB0
+CRC_DATA_OFFSET_FROM_MARKER = 0x70  # marker + 0x70 = file 0x100
 CRC_POLY = 0x1021
 CRC_INIT = 0x0000
 CRC_XOROUT = 0x0000
 
 
 class Mi5plusPatcher(ES32Patcher):
-    """Xiaomi 5 Plus patcher with verified speed hook and CRC-16 support."""
+    """Xiaomi 5 Plus patcher with verified speed hook and container CRC."""
 
     NAME = "Xiaomi Electric Scooter 5 Plus"
 
@@ -104,7 +95,7 @@ class Mi5plusPatcher(ES32Patcher):
         return {
             "size": len(self.data),
             "sha256": sha,
-            "known_reference_image": len(self.data) == FIRMWARE_SIZE and sha == FIRMWARE_SHA256,
+            "known_original": len(self.data) == FIRMWARE_SIZE and sha == FIRMWARE_SHA256,
         }
 
     @staticmethod
@@ -157,7 +148,7 @@ class Mi5plusPatcher(ES32Patcher):
         return self.hook_offset
 
     # ------------------------------------------------------------------
-    # 5 Plus CRC-16 container integrity
+    # 5 Plus container CRC-16
     # ------------------------------------------------------------------
     @staticmethod
     def _crc16_ccitt(data: bytes) -> int:
@@ -174,47 +165,33 @@ class Mi5plusPatcher(ES32Patcher):
     def _container_layout(self):
         marker = bytes(self.data).find(CONTAINER_MARKER)
         if marker < 0:
-            raise SignatureException(
-                "Mi 5 Plus: container marker SZMC-ES-02664-LQ not found"
-            )
+            raise SignatureException("Mi 5 Plus: container marker SZMC-ES-02664-LQ not found")
 
         size_pos = marker + CRC_SIZE_FIELD_OFFSET
+        crc_pos = marker + CRC_VALUE_OFFSET_FROM_MARKER
+        data_start = marker + CRC_DATA_OFFSET_FROM_MARKER
+
         if size_pos < 0 or size_pos + 2 > len(self.data):
             raise SignatureException("Mi 5 Plus: invalid CRC size field location")
+        if crc_pos < 0 or crc_pos + 2 > len(self.data):
+            raise SignatureException("Mi 5 Plus: invalid CRC storage location")
 
         region_size = int.from_bytes(self.data[size_pos:size_pos + 2], "big")
-        data_start = marker + CRC_DATA_OFFSET_FROM_MARKER
         data_end = data_start + region_size
-        crc_pos = marker + CRC_VALUE_OFFSET_FROM_MARKER
-
         if data_end > len(self.data):
             raise SignatureException(
                 f"Mi 5 Plus: CRC protected range exceeds firmware: 0x{data_start:X}:0x{data_end:X}"
             )
-        if crc_pos < 0 or crc_pos + 2 > len(self.data):
-            raise SignatureException("Mi 5 Plus: invalid CRC storage offset")
 
         return marker, region_size, data_start, data_end, crc_pos
 
     def fix_checksum(self):
-        """Recalculate the verified 5 Plus container CRC-16.
-
-        Reference image:
-            marker  = 0x90
-            size    = 0x8C00 at 0x86 (big-endian)
-            data    = [0x100:0x8D00]
-            CRC     = 0xEC8C at 0xB0 (big-endian)
-
-        The CRC field is outside the protected data range, so the calculation
-        is performed directly over the protected bytes.
-        """
+        """Recalculate the confirmed 5 Plus container CRC-16."""
         marker, region_size, data_start, data_end, crc_pos = self._container_layout()
-        protected = bytes(self.data[data_start:data_end])
         old = bytes(self.data[crc_pos:crc_pos + 2])
-        new_crc = self._crc16_ccitt(protected)
+        new_crc = self._crc16_ccitt(bytes(self.data[data_start:data_end]))
         post = new_crc.to_bytes(2, "big")
         self.data[crc_pos:crc_pos + 2] = post
-
         return [("fix_checksum_5plus", hex(crc_pos), old.hex(), post.hex())]
 
     def verify_checksum(self):
@@ -265,7 +242,7 @@ class Mi5plusPatcher(ES32Patcher):
         fp = self.firmware_fingerprint()
         print(f"Size: {fp['size']} (reference {FIRMWARE_SIZE})")
         print(f"SHA-256: {fp['sha256']}")
-        print(f"Reference image: {fp['known_reference_image']}")
+        print(f"Reference image: {fp['known_original']}")
         try:
             ofs = self.find_speed_hook()
             print(f"[+] Speed hook: file 0x{ofs:05X}, MCU 0x{FLASH_BASE_ADDR + ofs:08X}")
@@ -300,13 +277,20 @@ class Mi5plusPatcher(ES32Patcher):
             raise SignatureException(
                 f"Mi 5 Plus: unexpected opcode at 0x{self.hook_offset:X}: {pre.hex(' ')}"
             )
+
         if pre != post:
             self.data[self.hook_offset:self.hook_offset + 2] = post
+
+        # Speed hook is inside the verified protected range, so keep the
+        # container CRC valid even when the caller did not request `chk`.
+        crc_result = self.fix_checksum()
+
         self.current_speed = post[0]
         self.hook_form = "patched"
         return [
             ("speed_limit_active_profile", hex(self.hook_offset), pre.hex(), post.hex()),
             ("speed_hook_anchor", hex(self.hook_start), "??49787A0880", "verified"),
+            *crc_result,
         ]
 
     def speed_limit_active_profile(self, kmh):
@@ -345,7 +329,6 @@ class Mi5plusPatcher(ES32Patcher):
         return super().motor_start_speed(speed)
 
 
-# Compatibility for code importing the alternate capitalization.
 Mi5PlusPatcher = Mi5plusPatcher
 
 
@@ -353,5 +336,4 @@ def patch_mi5plus(firmware_data, speed_kmh=35):
     patcher = Mi5plusPatcher(firmware_data)
     patcher.diagnose()
     patcher.speed_limit_active_profile(speed_kmh)
-    patcher.fix_checksum()
     return patcher.data

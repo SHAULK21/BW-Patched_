@@ -54,7 +54,7 @@ The address is **CONFIRMED as a byte read/check in the controller function**. It
 
 An earlier interpretation — `0x200002E5 == 1` means "force 435" — is rejected. The patcher does not encode that semantic and does not patch this byte.
 
-## Mi 5 Plus container CRC-16
+## Mi5 Plus container CRC-16
 
 The 5 Plus package contains a verified container integrity field:
 
@@ -71,24 +71,24 @@ The generic ES32 checksum routine is intentionally not used for 5 Plus because i
 
 ## OTA package → embedded MCU image
 
-The reference package is a signed OTA container rather than a raw flash image. Its trailing binary footer begins with the unique marker:
+The reference file is an OTA container with a signed trailer rather than a bare raw image. The trailer begins with a unique binary marker:
 
 ```text
 MI EF TFOTA
 ```
 
-at file offset `0x1E480` and is followed by the model marker `xiaomi.scooter.5plus` and X.509 certificate data.
+The exact marker starts at file offset `0x1E484`. The preceding bytes at `0x1E480..0x1E483` are zero padding. The marker is followed by the model identifier `xiaomi.scooter.5plus` and X.509 certificate material.
 
 For the reference package:
 
 ```text
 OTA size:             125371 bytes (0x1E9BB)
-Image boundary:       0x1E480
-Embedded image size:  124032 bytes (0x1E480)
-OTA trailer size:     1339 bytes (0x53B)
+Image boundary:       0x1E484
+Embedded image size:  124036 bytes (0x1E484)
+OTA trailer size:     1335 bytes (0x537)
 ```
 
-The production `mi5plus` converter uses this validated footer rather than a hardcoded 64 KiB size. It first verifies the container CRC, then removes only the signed OTA trailer:
+The production `mi5plus` `img` operation validates the trailer and existing CRC, then keeps the exact prefix before the trailer. It does not synthesize a new 64 KiB image, and it does not shift any firmware-relative addresses.
 
 ```text
 OTA package
@@ -97,12 +97,10 @@ validate MI EF TFOTA + model + certificate
     ↓
 verify CRC
     ↓
-keep data[:0x1E480]
+keep data[:0x1E484]
     ↓
 embedded MCU image
 ```
-
-No synthetic vector table is created and no firmware bytes before the trailer are shifted. Therefore offsets such as `0x5C76` remain unchanged.
 
 CLI:
 
@@ -116,7 +114,7 @@ Patch speed and then extract the image:
 python -m bwpatcher mi5plus firmware.bin output_image_35.bin sld=35,img
 ```
 
-`img` refuses extraction when the OTA trailer or CRC cannot be validated. When an already-extracted image is supplied, it is accepted only when the confirmed speed hook is present.
+`img` refuses extraction when the OTA trailer or CRC cannot be validated. When an already-extracted image is supplied, it is accepted only when the confirmed speed hook can still be located.
 
 ## Confirmed / refuted mode claims
 

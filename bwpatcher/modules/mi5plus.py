@@ -12,7 +12,7 @@ Confirmed reference hook in that package:
     file 0x5C78: 08 80 = STRH r0,[r1]
 
 The package contains a signed OTA trailer beginning with the binary marker
-``MI EF TFOTA`` at file offset 0x1E480 in the reference file. The embedded
+``MI EF TFOTA`` at file offset 0x1E484 in the reference file. The embedded
 firmware image is the complete byte range before that trailer. No synthetic
 64 KiB image is generated; all original firmware-relative offsets are kept.
 
@@ -33,7 +33,6 @@ FLASH_BASE_ADDR = 0x08000000
 FIRMWARE_SIZE = 125371
 FIRMWARE_SHA256 = "bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4"
 
-# Confirmed speed hook.
 SPEED_HOOK_MCU = 0x08005C76
 SPEED_HOOK_OFFSET = SPEED_HOOK_MCU - FLASH_BASE_ADDR
 SPEED_HOOK_PREFIX = b"\xAB\x49"
@@ -42,21 +41,17 @@ SPEED_HOOK_ORIGINAL = b"\x78\x7A"
 SPEED_RUNTIME_ADDR = 0x20000234
 SPEED_PROFILE_FIELD = 0x09
 
-# Confirmed controller metadata from the reference package.
 SPEED_CONTROL_START_MCU = 0x08003698
 SPEED_CONTROL_END_MCU = 0x08003964
 SPEED_CONTROL_OBJECT = 0x20001E40
 SPEED_TARGET_FIELD = 0x14
 SPEED_LIMIT_FIELD = 0x18
 
-# Runtime byte checked by the controller. Its high-level semantics are not
-# proven and therefore are not encoded into any patch.
 SPEED_STATE_BYTE_ADDR = 0x200002E5
 SPEED_STATE_BYTE_STATUS = "SEMANTICS_UNVERIFIED"
 SPEED_SCALE_NUMERATOR = 0xAE
 SPEED_SCALE_DIVISOR = 10
 
-# Mode research only. No mode semantics are used for patching.
 MODE_STRUCTURE_ADDR = 0x20001E22
 MODE_FIELD_OFFSET = 0x0A
 MODE_FIELD_ADDR = MODE_STRUCTURE_ADDR + MODE_FIELD_OFFSET
@@ -70,18 +65,14 @@ REJECTED_RE_CLAIMS = {
     "claimed_0x200002E5_semantics": "value==1 -> 435 (rejected)",
 }
 
-# ---------------------------------------------------------------------------
-# 5 Plus OTA / embedded image boundary
-# ---------------------------------------------------------------------------
+# Reference OTA trailer/footer. The exact marker in the supplied BIN begins
+# at 0x1E484 (the preceding bytes at 0x1E480..0x1E483 are zero padding).
 OTA_TRAILER_MAGIC = b"MI\xEFTFOTA"
-OTA_TRAILER_REFERENCE_OFFSET = 0x1E480
+OTA_TRAILER_REFERENCE_OFFSET = 0x1E484
 OTA_TRAILER_MAX_TAIL = 0x2000
 OTA_MODEL_MARKER = b"xiaomi.scooter.5plus"
 OTA_CERT_MARKER = b"-----BEGIN CERTIFICATE-----"
 
-# ---------------------------------------------------------------------------
-# 5 Plus container CRC-16
-# ---------------------------------------------------------------------------
 CONTAINER_MARKER = b"SZMC-ES-02664-LQ"
 CRC_SIZE_FIELD_OFFSET = -0x0A
 CRC_VALUE_OFFSET_FROM_MARKER = 0x20
@@ -105,9 +96,6 @@ class Mi5plusPatcher(ES32Patcher):
         self.image_extracted = False
         self.ota_trailer_offset: Optional[int] = None
 
-    # ------------------------------------------------------------------
-    # Firmware identity / speed hook
-    # ------------------------------------------------------------------
     def firmware_fingerprint(self) -> dict:
         sha = hashlib.sha256(bytes(self.data)).hexdigest()
         return {
@@ -164,9 +152,6 @@ class Mi5plusPatcher(ES32Patcher):
         self.current_speed = self.data[self.hook_offset] if patched else None
         return self.hook_offset
 
-    # ------------------------------------------------------------------
-    # 5 Plus container CRC-16
-    # ------------------------------------------------------------------
     @staticmethod
     def _crc16_ccitt(data: bytes) -> int:
         crc = CRC_INIT
@@ -265,10 +250,10 @@ class Mi5plusPatcher(ES32Patcher):
         """Convert a signed OTA package to its embedded raw MCU image.
 
         The reference package has a unique binary ``MI EF TFOTA`` footer at
-        file offset 0x1E480. The image is the complete prefix before this
+        file offset 0x1E484. The image is the complete prefix before this
         validated footer. The function verifies the existing CRC first, then
-        strips only the signed trailer. No bytes inside the image are rewritten
-        and no synthetic flash image is generated.
+        strips only the signed OTA trailer. No bytes inside the image are
+        rewritten and no synthetic flash image is generated.
         """
         if self.image_extracted:
             return [("create_full_image", "already_extracted", "no_change", len(self.data))]
@@ -276,8 +261,6 @@ class Mi5plusPatcher(ES32Patcher):
         try:
             trailer = self._find_ota_trailer()
         except SignatureException:
-            # Accept an already-converted image only if the actual firmware
-            # speed hook is present; arbitrary files are rejected.
             self.find_speed_hook()
             self.image_extracted = True
             return [("create_full_image", "already_image", "no_change", len(self.data))]
@@ -313,9 +296,6 @@ class Mi5plusPatcher(ES32Patcher):
 
     extract_flash_image = create_full_image
 
-    # ------------------------------------------------------------------
-    # Diagnostics / RE map
-    # ------------------------------------------------------------------
     def reverse_engineering_map(self):
         fp = self.firmware_fingerprint()
         return {
@@ -370,9 +350,6 @@ class Mi5plusPatcher(ES32Patcher):
             print(f"[OTA] no validated trailer: {exc}")
         return self.hook_offset if self.hook_offset is not None else -1
 
-    # ------------------------------------------------------------------
-    # Speed patch
-    # ------------------------------------------------------------------
     @staticmethod
     def _speed_opcode(kmh):
         value = int(round(float(kmh)))
@@ -417,9 +394,6 @@ class Mi5plusPatcher(ES32Patcher):
     def remove_speed_limit_sport(self):
         return self._patch_speed(0xFF)
 
-    # ------------------------------------------------------------------
-    # Unverified operations remain disabled
-    # ------------------------------------------------------------------
     def region_free(self):
         raise SignatureException(
             "Mi 5 Plus: region table is unverified for this firmware; refusing guessed Flash writes."

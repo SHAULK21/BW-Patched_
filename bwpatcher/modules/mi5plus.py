@@ -2,17 +2,22 @@
 # -*- coding: utf-8 -*-
 """Xiaomi Electric Scooter 5 Plus / Brightway ES32.
 
-The speed patcher is based on the original 5 Plus BIN used during reverse
-engineering (125371 bytes, SHA-256 bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4).
+The speed patcher is based on the original 5 Plus OTA package used during
+reverse engineering (125371 bytes, SHA-256
+bdcec9c57c53279a19c28e437003e06e11f441170a349f94f7fdb140edd33cf4).
 
-Confirmed reference hook in that image:
+Confirmed reference hook in that package:
     file 0x5C74: AB 49 78 7A 08 80
     file 0x5C76: 78 7A = LDRB r0,[r7,#9]
     file 0x5C78: 08 80 = STRH r0,[r1]
 
-The module uses the verified 5 Plus container CRC format and keeps mode
-semantics evidence-only until a concrete value can be traced from input to
-control path.
+The package contains a signed OTA trailer beginning with the binary marker
+``MI EF TFOTA`` at file offset 0x1E480 in the reference file. The embedded
+firmware image is the complete byte range before that trailer. No synthetic
+64 KiB image is generated; all original firmware-relative offsets are kept.
+
+Mode semantics remain evidence-only until a concrete value can be traced from
+an input to the controller path.
 """
 
 from __future__ import annotations
@@ -33,19 +38,19 @@ SPEED_HOOK_MCU = 0x08005C76
 SPEED_HOOK_OFFSET = SPEED_HOOK_MCU - FLASH_BASE_ADDR
 SPEED_HOOK_PREFIX = b"\xAB\x49"
 SPEED_HOOK_SUFFIX = b"\x08\x80"
-SPEED_HOOK_ORIGINAL = b"\x78\x7A"  # LDRB r0,[r7,#9]
+SPEED_HOOK_ORIGINAL = b"\x78\x7A"
 SPEED_RUNTIME_ADDR = 0x20000234
 SPEED_PROFILE_FIELD = 0x09
 
-# Confirmed controller metadata from the reference BIN.
+# Confirmed controller metadata from the reference package.
 SPEED_CONTROL_START_MCU = 0x08003698
 SPEED_CONTROL_END_MCU = 0x08003964
 SPEED_CONTROL_OBJECT = 0x20001E40
 SPEED_TARGET_FIELD = 0x14
 SPEED_LIMIT_FIELD = 0x18
 
-# Runtime byte is confirmed as a controller input/check, but its application
-# semantics are not proven. In particular, do NOT encode "==1 -> 435" here.
+# Runtime byte checked by the controller. Its high-level semantics are not
+# proven and therefore are not encoded into any patch.
 SPEED_STATE_BYTE_ADDR = 0x200002E5
 SPEED_STATE_BYTE_STATUS = "SEMANTICS_UNVERIFIED"
 SPEED_SCALE_NUMERATOR = 0xAE
@@ -65,18 +70,29 @@ REJECTED_RE_CLAIMS = {
     "claimed_0x200002E5_semantics": "value==1 -> 435 (rejected)",
 }
 
-# Verified 5 Plus container CRC-16.
+# ---------------------------------------------------------------------------
+# 5 Plus OTA / embedded image boundary
+# ---------------------------------------------------------------------------
+OTA_TRAILER_MAGIC = b"MI\xEFTFOTA"
+OTA_TRAILER_REFERENCE_OFFSET = 0x1E480
+OTA_TRAILER_MAX_TAIL = 0x2000
+OTA_MODEL_MARKER = b"xiaomi.scooter.5plus"
+OTA_CERT_MARKER = b"-----BEGIN CERTIFICATE-----"
+
+# ---------------------------------------------------------------------------
+# 5 Plus container CRC-16
+# ---------------------------------------------------------------------------
 CONTAINER_MARKER = b"SZMC-ES-02664-LQ"
-CRC_SIZE_FIELD_OFFSET = -0x0A       # marker - 0x0A = file 0x86
-CRC_VALUE_OFFSET_FROM_MARKER = 0x20 # marker + 0x20 = file 0xB0
-CRC_DATA_OFFSET_FROM_MARKER = 0x70  # marker + 0x70 = file 0x100
+CRC_SIZE_FIELD_OFFSET = -0x0A
+CRC_VALUE_OFFSET_FROM_MARKER = 0x20
+CRC_DATA_OFFSET_FROM_MARKER = 0x70
 CRC_POLY = 0x1021
 CRC_INIT = 0x0000
 CRC_XOROUT = 0x0000
 
 
 class Mi5plusPatcher(ES32Patcher):
-    """Xiaomi 5 Plus patcher with verified speed hook and container CRC."""
+    """Xiaomi 5 Plus patcher with verified speed hook, CRC and OTA extraction."""
 
     NAME = "Xiaomi Electric Scooter 5 Plus"
 
@@ -86,6 +102,8 @@ class Mi5plusPatcher(ES32Patcher):
         self.hook_start: Optional[int] = None
         self.hook_form: Optional[str] = None
         self.current_speed: Optional[int] = None
+        self.image_extracted = False
+        self.ota_trailer_offset: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Firmware identity / speed hook
@@ -122,7 +140,6 @@ class Mi5plusPatcher(ES32Patcher):
             return known[0]
         if len(candidates) == 1:
             return candidates[0]
-
         data = bytes(self.data)
         expected = data[SPEED_HOOK_OFFSET - 2:SPEED_HOOK_OFFSET + 4]
         raise SignatureException(
@@ -163,7 +180,8 @@ class Mi5plusPatcher(ES32Patcher):
         return crc ^ CRC_XOROUT
 
     def _container_layout(self):
-        marker = bytes(self.data).find(CONTAINER_MARKER)
+        data = bytes(self.data)
+        marker = data.find(CONTAINER_MARKER)
         if marker < 0:
             raise SignatureException("Mi 5 Plus: container marker SZMC-ES-02664-LQ not found")
 
@@ -171,18 +189,17 @@ class Mi5plusPatcher(ES32Patcher):
         crc_pos = marker + CRC_VALUE_OFFSET_FROM_MARKER
         data_start = marker + CRC_DATA_OFFSET_FROM_MARKER
 
-        if size_pos < 0 or size_pos + 2 > len(self.data):
+        if size_pos < 0 or size_pos + 2 > len(data):
             raise SignatureException("Mi 5 Plus: invalid CRC size field location")
-        if crc_pos < 0 or crc_pos + 2 > len(self.data):
+        if crc_pos < 0 or crc_pos + 2 > len(data):
             raise SignatureException("Mi 5 Plus: invalid CRC storage location")
 
-        region_size = int.from_bytes(self.data[size_pos:size_pos + 2], "big")
+        region_size = int.from_bytes(data[size_pos:size_pos + 2], "big")
         data_end = data_start + region_size
-        if data_end > len(self.data):
+        if data_end > len(data):
             raise SignatureException(
                 f"Mi 5 Plus: CRC protected range exceeds firmware: 0x{data_start:X}:0x{data_end:X}"
             )
-
         return marker, region_size, data_start, data_end, crc_pos
 
     def fix_checksum(self):
@@ -210,6 +227,93 @@ class Mi5plusPatcher(ES32Patcher):
         }
 
     # ------------------------------------------------------------------
+    # OTA -> embedded MCU image
+    # ------------------------------------------------------------------
+    def _find_ota_trailer(self) -> int:
+        """Find and validate the signed OTA trailer boundary."""
+        data = bytes(self.data)
+        start = max(0, len(data) - OTA_TRAILER_MAX_TAIL)
+        hits = []
+        pos = start
+        while True:
+            hit = data.find(OTA_TRAILER_MAGIC, pos)
+            if hit < 0:
+                break
+            hits.append(hit)
+            pos = hit + 1
+
+        if len(hits) != 1:
+            raise SignatureException(
+                f"Mi 5 Plus: OTA trailer marker is not unique ({len(hits)} matches)"
+            )
+
+        trailer = hits[0]
+        model_pos = data.find(OTA_MODEL_MARKER, trailer, min(len(data), trailer + 0x100))
+        cert_pos = data.find(OTA_CERT_MARKER, trailer)
+        if model_pos < 0 or cert_pos < 0 or not (trailer < model_pos < cert_pos):
+            raise SignatureException("Mi 5 Plus: OTA trailer validation failed")
+        return trailer
+
+    def is_ota_container(self) -> bool:
+        try:
+            self._find_ota_trailer()
+            return True
+        except SignatureException:
+            return False
+
+    def create_full_image(self):
+        """Convert a signed OTA package to its embedded raw MCU image.
+
+        The reference package has a unique binary ``MI EF TFOTA`` footer at
+        file offset 0x1E480. The image is the complete prefix before this
+        validated footer. The function verifies the existing CRC first, then
+        strips only the signed trailer. No bytes inside the image are rewritten
+        and no synthetic flash image is generated.
+        """
+        if self.image_extracted:
+            return [("create_full_image", "already_extracted", "no_change", len(self.data))]
+
+        try:
+            trailer = self._find_ota_trailer()
+        except SignatureException:
+            # Accept an already-converted image only if the actual firmware
+            # speed hook is present; arbitrary files are rejected.
+            self.find_speed_hook()
+            self.image_extracted = True
+            return [("create_full_image", "already_image", "no_change", len(self.data))]
+
+        crc = self.verify_checksum()
+        if not crc["valid"]:
+            raise SignatureException(
+                f"Mi 5 Plus: refusing OTA extraction because CRC is invalid "
+                f"(stored=0x{crc['stored']:04X}, computed=0x{crc['computed']:04X})"
+            )
+
+        image = self.data[:trailer]
+        if len(image) <= SPEED_HOOK_OFFSET + 1:
+            raise SignatureException("Mi 5 Plus: extracted image is too short")
+
+        self.data = bytearray(image)
+        self.image_extracted = True
+        self.ota_trailer_offset = trailer
+
+        self.find_speed_hook()
+        post_crc = self.verify_checksum()
+        if not post_crc["valid"]:
+            raise SignatureException("Mi 5 Plus: extracted image failed CRC revalidation")
+
+        return [
+            ("create_full_image", hex(trailer), "OTA+signature", "embedded_mcu_image"),
+            ("image_size", str(len(image)), "", ""),
+            ("image_end", hex(trailer), "", ""),
+            ("image_speed_hook", hex(self.hook_offset), "verified", "verified"),
+            ("image_crc", hex(post_crc["crc_offset"]),
+             f"0x{post_crc['stored']:04X}", f"valid=0x{post_crc['computed']:04X}"),
+        ]
+
+    extract_flash_image = create_full_image
+
+    # ------------------------------------------------------------------
     # Diagnostics / RE map
     # ------------------------------------------------------------------
     def reverse_engineering_map(self):
@@ -231,13 +335,15 @@ class Mi5plusPatcher(ES32Patcher):
             "mode_structure_addr": MODE_STRUCTURE_ADDR,
             "mode_field_addr": MODE_FIELD_ADDR,
             "mode_mapping_status": MODE_MAPPING_STATUS,
+            "ota_trailer_magic": OTA_TRAILER_MAGIC.hex(),
+            "ota_trailer_reference_offset": OTA_TRAILER_REFERENCE_OFFSET,
             "rejected_claims": dict(REJECTED_RE_CLAIMS),
         }
 
     def diagnose(self):
         print("=" * 72)
         print("XIAOMI 5 PLUS / BRIGHTWAY ES32")
-        print("Evidence-first speed / CRC diagnostic")
+        print("Evidence-first speed / OTA diagnostic")
         print("=" * 72)
         fp = self.firmware_fingerprint()
         print(f"Size: {fp['size']} (reference {FIRMWARE_SIZE})")
@@ -257,6 +363,11 @@ class Mi5plusPatcher(ES32Patcher):
             )
         except SignatureException as exc:
             print(f"[CRC] [-] {exc}")
+        try:
+            trailer = self._find_ota_trailer()
+            print(f"[OTA] trailer=0x{trailer:X}; embedded image size={trailer} bytes")
+        except SignatureException as exc:
+            print(f"[OTA] no validated trailer: {exc}")
         return self.hook_offset if self.hook_offset is not None else -1
 
     # ------------------------------------------------------------------
@@ -277,16 +388,11 @@ class Mi5plusPatcher(ES32Patcher):
             raise SignatureException(
                 f"Mi 5 Plus: unexpected opcode at 0x{self.hook_offset:X}: {pre.hex(' ')}"
             )
-
         if pre != post:
             self.data[self.hook_offset:self.hook_offset + 2] = post
-
-        # Speed hook is inside the verified protected range, so keep the
-        # container CRC valid even when the caller did not request `chk`.
-        crc_result = self.fix_checksum()
-
         self.current_speed = post[0]
         self.hook_form = "patched"
+        crc_result = self.fix_checksum()
         return [
             ("speed_limit_active_profile", hex(self.hook_offset), pre.hex(), post.hex()),
             ("speed_hook_anchor", hex(self.hook_start), "??49787A0880", "verified"),
@@ -332,8 +438,10 @@ class Mi5plusPatcher(ES32Patcher):
 Mi5PlusPatcher = Mi5plusPatcher
 
 
-def patch_mi5plus(firmware_data, speed_kmh=35):
-    patcher = Mi5plusPatcher(firmware_data)
-    patcher.diagnose()
+def patch_mi5plus(firmware_data, speed_kmh=35, extract_image=False):
+    """Patch speed and optionally return the embedded raw image."""
+    patcher = Mi5PlusPatcher(firmware_data)
     patcher.speed_limit_active_profile(speed_kmh)
+    if extract_image:
+        patcher.create_full_image()
     return patcher.data
